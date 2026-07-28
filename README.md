@@ -1,8 +1,10 @@
 To run this environment install on the terminal using these command line
-python3 -m venv venv or python -m venv venv based on the version
+python3 -m venv venv or python -m venv venv based on the version you downloaded inn your machine/local
 
 Then install the following dependencies on the requirements.txt using the commandline
 pip install -r requirements.txt
+
+Before you install the dependencies first you need to activate below the steps
 
 To activate the environment 
 source venv/bin/activate #Linux
