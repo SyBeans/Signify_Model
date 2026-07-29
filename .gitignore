@@ -1,3 +1,5 @@
 venv/
 datasets/
 datasets/FSL
+landmarks/
+models/
