@@ -1,7 +1,6 @@
 """
-train_model.py
-Trains an LSTM model on extracted hand landmarks.
-Saves the trained model to models/sign_model.h5
+train_model.py (IMPROVED)
+Trains an LSTM model with better settings for FSL-105
 """
 
 import numpy as np
@@ -10,7 +9,7 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.preprocessing import LabelEncoder
+from sklearn.utils import class_weight
 import tensorflow as tf
 from tensorflow import keras
 from keras import layers, models, callbacks
@@ -22,15 +21,14 @@ LANDMARKS_PATH = "landmarks"
 MODELS_PATH = "models"
 LABELS_CSV = "datasets/FSL/labels.csv"
 
-# Training settings
-BATCH_SIZE = 32
-EPOCHS = 50
-LEARNING_RATE = 0.001
-TEST_SIZE = 0.2  # Validation split
+# Training settings - IMPROVED
+BATCH_SIZE = 16          # Smaller batch
+EPOCHS = 100             # More epochs
+LEARNING_RATE = 0.0005   # Lower learning rate
+TEST_SIZE = 0.2
 
-# Model settings
 NUM_FRAMES = 30
-NUM_FEATURES = 63  # 21 landmarks × 3 coordinates
+NUM_FEATURES = 63
 NUM_CLASSES = 105
 
 # ============================================
@@ -51,59 +49,86 @@ print(f"X_test shape:  {X_test.shape}")
 print(f"y_test shape:  {y_test.shape}")
 
 # ============================================
-# LOAD LABEL MAPPING
-# ============================================
-labels_df = pd.read_csv(LABELS_CSV)
-label_names = labels_df['label'].tolist()  # English labels
-print(f"\n📊 Classes: {len(label_names)}")
-print(f"First 5 labels: {label_names[:5]}")
-
-# ============================================
-# ENCODE LABELS (0-104 → One-Hot)
+# NORMALIZE DATA (IMPORTANT!)
 # ============================================
 print("\n" + "=" * 60)
-print("🔢 ENCODING LABELS")
+print("🔧 NORMALIZING DATA")
 print("=" * 60)
 
-# Labels are already 0-104, just convert to categorical
+# Flatten, normalize, reshape back
+X_train_flat = X_train.reshape(X_train.shape[0], -1)
+X_test_flat = X_test.reshape(X_test.shape[0], -1)
+
+# Simple min-max normalization
+X_train_norm = (X_train_flat - X_train_flat.min()) / (X_train_flat.max() - X_train_flat.min() + 1e-8)
+X_test_norm = (X_test_flat - X_test_flat.min()) / (X_test_flat.max() - X_test_flat.min() + 1e-8)
+
+X_train = X_train_norm.reshape(X_train.shape)
+X_test = X_test_norm.reshape(X_test.shape)
+
+print("✅ Data normalized (0-1 range)")
+
+# ============================================
+# LOAD LABELS
+# ============================================
+labels_df = pd.read_csv(LABELS_CSV)
+label_names = labels_df['label'].tolist()
+print(f"\n📊 Classes: {len(label_names)}")
+
+# ============================================
+# COMPUTE CLASS WEIGHTS (Fixes imbalance)
+# ============================================
+print("\n" + "=" * 60)
+print("⚖️  COMPUTING CLASS WEIGHTS")
+print("=" * 60)
+
+class_weights = class_weight.compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(y_train),
+    y=y_train
+)
+class_weight_dict = dict(enumerate(class_weights))
+print(f"✅ Class weights computed (range: {min(class_weights):.2f} - {max(class_weights):.2f})")
+
+# ============================================
+# ENCODE LABELS
+# ============================================
 y_train_cat = keras.utils.to_categorical(y_train, num_classes=NUM_CLASSES)
 y_test_cat = keras.utils.to_categorical(y_test, num_classes=NUM_CLASSES)
 
-print(f"y_train_cat shape: {y_train_cat.shape}")
-print(f"y_test_cat shape:  {y_test_cat.shape}")
-
 # ============================================
-# BUILD LSTM MODEL
+# BUILD IMPROVED MODEL
 # ============================================
 print("\n" + "=" * 60)
-print("🏗️  BUILDING MODEL")
+print("🏗️  BUILDING IMPROVED MODEL")
 print("=" * 60)
 
 model = models.Sequential([
-    # LSTM Layer 1
-    layers.LSTM(128, return_sequences=True, input_shape=(NUM_FRAMES, NUM_FEATURES)),
-    layers.BatchNormalization(),
-    layers.Dropout(0.3),
+    # Input layer
+    layers.Input(shape=(NUM_FRAMES, NUM_FEATURES)),
     
-    # LSTM Layer 2
+    # LSTM 1
+    layers.LSTM(64, return_sequences=True),
+    layers.Dropout(0.4),
+    
+    # LSTM 2
     layers.LSTM(128, return_sequences=True),
-    layers.BatchNormalization(),
-    layers.Dropout(0.3),
+    layers.Dropout(0.4),
     
-    # LSTM Layer 3
+    # LSTM 3
     layers.LSTM(64, return_sequences=False),
-    layers.BatchNormalization(),
-    layers.Dropout(0.3),
+    layers.Dropout(0.4),
     
-    # Dense Layer
+    # Dense layers
+    layers.Dense(128, activation='relu'),
+    layers.Dropout(0.5),
     layers.Dense(64, activation='relu'),
-    layers.Dropout(0.3),
+    layers.Dropout(0.5),
     
-    # Output Layer
+    # Output
     layers.Dense(NUM_CLASSES, activation='softmax')
 ])
 
-# Compile
 model.compile(
     optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
     loss='categorical_crossentropy',
@@ -118,22 +143,19 @@ model.summary()
 os.makedirs(MODELS_PATH, exist_ok=True)
 
 callbacks_list = [
-    # Early stopping if no improvement
     callbacks.EarlyStopping(
         monitor='val_accuracy',
-        patience=10,
+        patience=25,          # More patience
         restore_best_weights=True,
         verbose=1
     ),
-    # Reduce learning rate when plateau
     callbacks.ReduceLROnPlateau(
         monitor='val_loss',
         factor=0.5,
-        patience=5,
+        patience=8,
         min_lr=1e-6,
         verbose=1
     ),
-    # Save best model
     callbacks.ModelCheckpoint(
         os.path.join(MODELS_PATH, 'best_model.h5'),
         monitor='val_accuracy',
@@ -146,7 +168,7 @@ callbacks_list = [
 # TRAIN
 # ============================================
 print("\n" + "=" * 60)
-print("🚀 TRAINING MODEL")
+print("🚀 TRAINING MODEL (Improved)")
 print("=" * 60)
 
 history = model.fit(
@@ -155,11 +177,12 @@ history = model.fit(
     epochs=EPOCHS,
     validation_split=TEST_SIZE,
     callbacks=callbacks_list,
+    class_weight=class_weight_dict,  # Use class weights!
     verbose=1
 )
 
 # ============================================
-# EVALUATE ON TEST SET
+# EVALUATE
 # ============================================
 print("\n" + "=" * 60)
 print("📊 EVALUATING ON TEST SET")
@@ -170,67 +193,33 @@ print(f"\n✅ Test Accuracy: {test_accuracy * 100:.2f}%")
 print(f"✅ Test Loss: {test_loss:.4f}")
 
 # ============================================
-# PREDICTIONS & METRICS
+# PREDICTIONS
 # ============================================
-print("\n" + "=" * 60)
-print("📈 DETAILED METRICS")
-print("=" * 60)
-
 y_pred = model.predict(X_test)
 y_pred_classes = np.argmax(y_pred, axis=1)
 y_true_classes = np.argmax(y_test_cat, axis=1)
 
-# Accuracy per class
-print("\n📋 Classification Report (Top 10 signs):")
-# Get unique classes in test set
-unique_classes = np.unique(y_true_classes)
-top_classes = unique_classes[:10]
-target_names = [label_names[i] for i in top_classes]
-
-# Filter for top classes
-mask = np.isin(y_true_classes, top_classes)
-print(classification_report(
-    y_true_classes[mask], 
-    y_pred_classes[mask], 
-    labels=top_classes,
-    target_names=target_names,
-    zero_division=0
-))
-
-# Overall accuracy
 overall_accuracy = accuracy_score(y_true_classes, y_pred_classes)
-print(f"Overall Accuracy: {overall_accuracy * 100:.2f}%")
+print(f"\n🎯 Overall Accuracy: {overall_accuracy * 100:.2f}%")
+
+# Per-class accuracy
+print("\n📋 Top 10 Signs by Accuracy:")
+class_accuracies = []
+for i in range(NUM_CLASSES):
+    mask = y_true_classes == i
+    if mask.sum() > 0:
+        acc = accuracy_score(y_true_classes[mask], y_pred_classes[mask])
+        class_accuracies.append((i, label_names[i], acc, mask.sum()))
+
+class_accuracies.sort(key=lambda x: x[2], reverse=True)
+for i, (cls_id, name, acc, count) in enumerate(class_accuracies[:10]):
+    print(f"  {i+1}. {name:20s} → {acc*100:5.1f}% ({count} samples)")
 
 # ============================================
-# CONFUSION MATRIX (SIMPLIFIED)
+# TRAINING PLOTS
 # ============================================
-print("\n" + "=" * 60)
-print("📊 CONFUSION MATRIX (Top 10 Signs)")
-print("=" * 60)
-
-cm = confusion_matrix(y_true_classes[mask], y_pred_classes[mask], labels=top_classes)
-
-plt.figure(figsize=(12, 10))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-            xticklabels=target_names,
-            yticklabels=target_names)
-plt.title('Confusion Matrix - Top 10 Signs')
-plt.xlabel('Predicted')
-plt.ylabel('True')
-plt.tight_layout()
-plt.savefig(os.path.join(MODELS_PATH, 'confusion_matrix.png'), dpi=150)
-print(f"✅ Saved to {MODELS_PATH}/confusion_matrix.png")
-
-# ============================================
-# TRAINING HISTORY PLOTS
-# ============================================
-print("\n" + "=" * 60)
-print("📈 TRAINING HISTORY")
-print("=" * 60)
-
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-# Accuracy plot
 ax1.plot(history.history['accuracy'], label='Train')
 ax1.plot(history.history['val_accuracy'], label='Validation')
 ax1.set_title('Model Accuracy')
@@ -239,7 +228,6 @@ ax1.set_ylabel('Accuracy')
 ax1.legend()
 ax1.grid(True)
 
-# Loss plot
 ax2.plot(history.history['loss'], label='Train')
 ax2.plot(history.history['val_loss'], label='Validation')
 ax2.set_title('Model Loss')
@@ -250,25 +238,16 @@ ax2.grid(True)
 
 plt.tight_layout()
 plt.savefig(os.path.join(MODELS_PATH, 'training_history.png'), dpi=150)
-print(f"✅ Saved to {MODELS_PATH}/training_history.png")
+print(f"\n✅ Saved to {MODELS_PATH}/training_history.png")
 
 # ============================================
-# SAVE FINAL MODEL
+# SAVE
 # ============================================
-print("\n" + "=" * 60)
-print("💾 SAVING MODEL")
-print("=" * 60)
-
 model.save(os.path.join(MODELS_PATH, 'sign_model.h5'))
 print(f"✅ Saved to {MODELS_PATH}/sign_model.h5")
 
-# ============================================
-# SUMMARY
-# ============================================
 print("\n" + "=" * 60)
 print("✅ TRAINING COMPLETE!")
 print("=" * 60)
-print(f"Model: {MODELS_PATH}/sign_model.h5")
 print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
-print(f"Total Parameters: {model.count_params():,}")
-print(f"\nNext step: python convert_to_tflite.py")
+print(f"Next step: python convert_to_tflite.py")
