@@ -1,5 +1,6 @@
 venv_extract/
 venv_train/
+venv_test/
 datasets/
 datasets/FSL
 landmarks/
