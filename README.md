@@ -43,3 +43,10 @@ after deactivating it activate the
 then run
 # train_model.py 
 to train the model 
+
+
+=== Testing ===
+Same process of installation, installing first the venv naming venv_test and installing the requirements
+and activating first then run the 
+# test_webcam.py
+to test the trained model 
