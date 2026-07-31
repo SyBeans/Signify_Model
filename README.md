@@ -1,12 +1,16 @@
 To run this environment install on the terminal using these command line
 python3 -m venv venv or python -m venv venv based on the version you downloaded inn your machine/local
 
+=== Installation process ===
 But the case is there is a conflict between mediapipe and protobuf if the same environment so the solution is
-use this command for extraction virtual environment 
-# python3 -m venv venv_extract #for extracting the landmarks first 
+separating them a venv so two venv for this project 
+
+Use this command for extraction virtual environment 
+# python3 -m venv venv_extract 
+for extracting the landmarks first 
 
 Then install the following dependencies on the requirements_extract.txt using the commandline
-pip install -r requirements_extract.txt
+# pip install -r requirements_extract.txt
 
 Use this after downloading the extraction to train the extracted landmarks
 # python3 -m venv venv_train
@@ -27,7 +31,8 @@ or
 To deactivate the environment
 # deactivate
 
-But first you must activate them one by one
+=== Activating the Virtaul Environemt ===
+Must activate them one by one
 activate the venv_extract then run the 
 # extract_landmark.py 
 for extracting the landmarks from the video
