@@ -5,5 +5,7 @@ datasets/
 datasets/FER2013
 datasets/FSL
 landmarks/
+landmarks/face
+landmarks/hand
 models/
 kaggle_dl/

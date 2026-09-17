@@ -18,7 +18,7 @@ DATASET_PATH = "datasets/FSL"
 TRAIN_CSV = os.path.join(DATASET_PATH, "train.csv")
 TEST_CSV = os.path.join(DATASET_PATH, "test.csv")
 LABELS_CSV = os.path.join(DATASET_PATH, "labels.csv")
-LANDMARKS_PATH = "landmarks"
+LANDMARKS_PATH = "landmarks/hand"
 
 NUM_FRAMES = 30
 NUM_LANDMARKS = 21

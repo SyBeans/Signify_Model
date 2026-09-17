@@ -16,7 +16,7 @@ from tqdm import tqdm
 FER2013_PATH = os.path.expanduser(
     "~/Signify/Signify_Model/datasets/FER2013"
 )
-LANDMARKS_PATH = "landmarks"
+LANDMARKS_PATH = "landmarks/face"
 
 NUM_FACE_LANDMARKS = 468
 NUM_COORDS = 3
