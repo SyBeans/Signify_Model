@@ -1,6 +1,12 @@
 """
-extract_landmarks_v5_hybrid.py
-BEST OF BOTH: V3 (frames with hands) + V4 (position + velocity)
+extract_landmarks_v6_twohand.py
+Extracts BOTH hands (max_num_hands=2) with position + velocity features.
+Saves 252 features per frame (126 per hand).
+
+Features breakdown:
+  Hand 1: 21 landmarks × 3 (x,y,z) = 63 position + 63 velocity = 126
+  Hand 2: 21 landmarks × 3 (x,y,z) = 63 position + 63 velocity = 126
+  Total: 252 features per frame
 """
 
 import os
@@ -10,6 +16,9 @@ import pandas as pd
 import mediapipe as mp
 from tqdm import tqdm
 
+# ============================================
+# CONFIGURATION
+# ============================================
 DATASET_PATH = "datasets/FSL"
 TRAIN_CSV = os.path.join(DATASET_PATH, "train.csv")
 TEST_CSV = os.path.join(DATASET_PATH, "test.csv")
@@ -19,25 +28,37 @@ LANDMARKS_PATH = "landmarks/hand"
 NUM_FRAMES = 30
 NUM_LANDMARKS = 21
 NUM_COORDS = 3
-MIN_HAND_FRAMES = 15  # Need at least 15 frames with hands
+HAND_FEATURES = NUM_LANDMARKS * NUM_COORDS  # 63 per hand
+MIN_HAND_FRAMES = 15
+MAX_HANDS = 2
 
+# ============================================
+# INITIALIZE MEDIAPIPE
+# ============================================
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
-    max_num_hands=1,
+    max_num_hands=MAX_HANDS,    # ← Detect up to 2 hands
     min_detection_confidence=0.3,
     min_tracking_confidence=0.3
 )
 
 
+def extract_hand_features(hand_landmarks):
+    """Extract 63 features (21 landmarks × 3 coords) from one hand."""
+    features = []
+    for lm in hand_landmarks.landmark:
+        features.extend([lm.x, lm.y, lm.z])
+    return features
+
+
 def extract_landmarks_from_video(video_path):
     """
-    Step 1: Scan ALL frames, collect only frames WITH hands (like V3)
-    Step 2: Take 30 best frames evenly spaced (like V3)
-    Step 3: Compute velocity features (like V4)
+    Scan ALL frames, collect frames with hands.
+    For each frame: extract up to 2 hands (pad missing hand with zeros).
+    Returns (30, 252) with position + velocity features.
     """
     cap = cv2.VideoCapture(video_path)
-
     hand_frames = []
 
     while True:
@@ -49,35 +70,42 @@ def extract_landmarks_from_video(video_path):
         results = hands.process(frame_rgb)
 
         if results.multi_hand_landmarks:
-            hand_landmarks = results.multi_hand_landmarks[0]
-            landmarks = []
-            for lm in hand_landmarks.landmark:
-                landmarks.extend([lm.x, lm.y, lm.z])
-            hand_frames.append(landmarks)
+            num_detected = len(results.multi_hand_landmarks)
+
+            # Hand 1
+            hand1 = extract_hand_features(results.multi_hand_landmarks[0])
+
+            # Hand 2 (or zeros if only 1 hand)
+            if num_detected >= 2:
+                hand2 = extract_hand_features(results.multi_hand_landmarks[1])
+            else:
+                hand2 = [0.0] * HAND_FEATURES  # Pad with zeros
+
+            # Combined: 126 features (63 + 63)
+            hand_frames.append(hand1 + hand2)
 
     cap.release()
 
     if len(hand_frames) < MIN_HAND_FRAMES:
         return None
 
-    # Take 30 frames from hand_frames
+    # Take 30 evenly spaced frames
     if len(hand_frames) >= NUM_FRAMES:
         indices = np.linspace(0, len(hand_frames) - 1, NUM_FRAMES, dtype=int)
         selected = [hand_frames[i] for i in indices]
     else:
-        # Pad by repeating last frame
         selected = hand_frames.copy()
         while len(selected) < NUM_FRAMES:
             selected.append(hand_frames[-1])
 
-    positions = np.array(selected, dtype=np.float32)  # (30, 63)
+    positions = np.array(selected, dtype=np.float32)  # (30, 126)
 
-    # Compute velocity
+    # Velocity (difference between consecutive frames)
     velocities = np.zeros_like(positions)
     velocities[1:] = positions[1:] - positions[:-1]
 
-    # Concatenate position + velocity
-    combined = np.concatenate([positions, velocities], axis=1)  # (30, 126)
+    # Combined: (30, 252)
+    combined = np.concatenate([positions, velocities], axis=1)
 
     return combined
 
@@ -121,7 +149,9 @@ def main():
 
     labels_df = pd.read_csv(LABELS_CSV)
     print(f"\n📊 Total Signs: {len(labels_df)}")
-    print(f"📋 Features per frame: 126 (63 position + 63 velocity)")
+    print(f"📋 Max hands: {MAX_HANDS}")
+    print(f"📋 Features per frame: 252 (126 per hand × 2 hands)")
+    print(f"📋 Model input shape: (30, 252)")
 
     train_df = pd.read_csv(TRAIN_CSV)
     X_train, y_train = process_split(train_df, "train")
@@ -135,7 +165,9 @@ def main():
     np.save(os.path.join(LANDMARKS_PATH, "y_test.npy"), y_test)
 
     print(f"\n✅ Saved to {LANDMARKS_PATH}/")
-    print(f"✅ DONE!")
+    print(f"✅ X_train: {X_train.shape}")
+    print(f"✅ X_test:  {X_test.shape}")
+    print(f"\n✅ DONE! Next: train_model_v6_twohand.py")
 
 
 if __name__ == "__main__":

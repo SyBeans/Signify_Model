@@ -1,7 +1,7 @@
 """
 train_model_v3_motion.py
 Trains a Bidirectional LSTM model on motion features (position + velocity).
-Best for motion-aware sign recognition.
+Now supports 2-hand input (252 features per frame).
 """
 
 import numpy as np
@@ -26,7 +26,7 @@ EPOCHS = 100
 LEARNING_RATE = 0.001
 
 NUM_FRAMES = 30
-NUM_FEATURES = 126  # 63 position + 63 velocity
+NUM_FEATURES = 252  # 63 position + 63 velocity
 NUM_CLASSES = 105
 
 # ============================================
