@@ -1,159 +1,138 @@
 """
 extract_facial_features.py
-Extracts facial landmarks for emotion recognition.
-Uses MediaPipe Face Mesh (OLD API - no .task file needed).
+Extracts 468 facial landmarks from FER2013 images using MediaPipe Face Mesh.
+Saves as .npy files for training the emotion model.
 """
 
 import os
 import cv2
 import numpy as np
-import pandas as pd
 import mediapipe as mp
 from tqdm import tqdm
 
 # ============================================
 # CONFIGURATION
 # ============================================
-DATASET_PATH = "datasets/FSL"
-TRAIN_CSV = os.path.join(DATASET_PATH, "train.csv")
-TEST_CSV = os.path.join(DATASET_PATH, "test.csv")
+FER2013_PATH = os.path.expanduser(
+    "~/Signify/Signify_Model/datasets/FER2013"
+)
 LANDMARKS_PATH = "landmarks"
 
-NUM_FRAMES = 30
-NUM_FACE_LANDMARKS = 468  # MediaPipe Face Mesh has 468 landmarks (not 478)
-NUM_COORDS = 3  # x, y, z
+NUM_FACE_LANDMARKS = 468
+NUM_COORDS = 3
+NUM_FEATURES = NUM_FACE_LANDMARKS * NUM_COORDS  # 1404
+
+# Emotion order (must match training script!)
+EMOTIONS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
+EMOTION_TO_ID = {name: i for i, name in enumerate(EMOTIONS)}
 
 # ============================================
-# INITIALIZE FACE MESH (OLD API)
+# INITIALIZE MEDIAPIPE FACE MESH
 # ============================================
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,
+    static_image_mode=True,        # Image mode (not video)
     max_num_faces=1,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+    refine_landmarks=False,
+    min_detection_confidence=0.3
 )
 
 
-def extract_face_from_video(video_path):
-    """Extract face landmarks from video frames."""
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    if total_frames < NUM_FRAMES:
-        cap.release()
+def extract_face_landmarks(image_path):
+    """Extract 468 face landmarks from a single image."""
+    img = cv2.imread(image_path)
+    if img is None:
         return None
-    
-    frame_indices = np.linspace(0, total_frames - 1, NUM_FRAMES, dtype=int)
-    all_faces = []
-    face_count = 0
-    
-    for frame_idx in frame_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        
-        if not ret:
-            all_faces.append(None)
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(img_rgb)
+
+    if not results.multi_face_landmarks:
+        return None
+
+    face_landmarks = results.multi_face_landmarks[0]
+    landmarks = []
+    for lm in face_landmarks.landmark:
+        landmarks.extend([lm.x, lm.y, lm.z])
+
+    return np.array(landmarks, dtype=np.float32)
+
+
+def process_split(split_name):
+    """Process one split (train/test/val)."""
+    split_path = os.path.join(FER2013_PATH, split_name)
+    X, y = [], []
+    skipped_no_face = 0
+
+    print(f"\n{'=' * 60}")
+    print(f"🔨 PROCESSING {split_name.upper()}")
+    print(f"{'=' * 60}")
+
+    for emotion in EMOTIONS:
+        emotion_path = os.path.join(split_path, emotion)
+        if not os.path.exists(emotion_path):
+            print(f"⚠️  Skipping {emotion} (not found)")
             continue
-        
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(frame_rgb)
-        
-        if results.multi_face_landmarks:
-            face_landmarks = results.multi_face_landmarks[0]
-            landmarks = []
-            for lm in face_landmarks.landmark:
-                landmarks.extend([lm.x, lm.y, lm.z])
-            all_faces.append(landmarks)
-            face_count += 1
-        else:
-            all_faces.append(None)
-    
-    cap.release()
-    
-    # Need at least 10 frames with faces
-    if face_count < 10:
-        return None
-    
-    # Fill missing frames
-    for i in range(len(all_faces)):
-        if all_faces[i] is None:
-            for j in range(1, NUM_FRAMES):
-                if i - j >= 0 and all_faces[i - j] is not None:
-                    all_faces[i] = all_faces[i - j].copy()
-                    break
-                if i + j < NUM_FRAMES and all_faces[i + j] is not None:
-                    all_faces[i] = all_faces[i + j].copy()
-                    break
-            if all_faces[i] is None:
-                all_faces[i] = [0.0] * (NUM_FACE_LANDMARKS * NUM_COORDS)
-    
-    return np.array(all_faces, dtype=np.float32)  # (30, 1404)
+
+        files = [f for f in os.listdir(emotion_path)
+                 if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+        for fname in tqdm(files, desc=f"{emotion:10s}", leave=False):
+            img_path = os.path.join(emotion_path, fname)
+            landmarks = extract_face_landmarks(img_path)
+
+            if landmarks is None:
+                skipped_no_face += 1
+                continue
+
+            X.append(landmarks)
+            y.append(EMOTION_TO_ID[emotion])
+
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.int32)
+
+    print(f"✅ {split_name}: X = {X.shape}, y = {y.shape}")
+    print(f"   Skipped (no face): {skipped_no_face}")
+
+    return X, y
 
 
-def process_dataset():
-    """Extract face landmarks from all videos."""
+def main():
     os.makedirs(LANDMARKS_PATH, exist_ok=True)
-    
-    print("\n" + "=" * 60)
-    print("🔨 EXTRACTING FACIAL LANDMARKS (Training)")
+
     print("=" * 60)
-    
-    train_df = pd.read_csv(TRAIN_CSV)
-    X_face_train = []
-    skipped = 0
-    
-    for idx, row in tqdm(train_df.iterrows(), total=len(train_df), desc="Training"):
-        video_path = os.path.join(DATASET_PATH, row['vid_path'].replace('\\', '/'))
-        
-        if not os.path.exists(video_path):
-            skipped += 1
-            continue
-        
-        faces = extract_face_from_video(video_path)
-        if faces is not None:
-            X_face_train.append(faces)
-        else:
-            skipped += 1
-    
-    X_face_train = np.array(X_face_train, dtype=np.float32)
-    print(f"\n✅ X_face_train: {X_face_train.shape}")
-    print(f"⚠️  Skipped: {skipped}")
-    
-    # ============================================
-    print("\n" + "=" * 60)
-    print("🔨 EXTRACTING FACIAL LANDMARKS (Testing)")
+    print("📊 FER2013 FACIAL LANDMARK EXTRACTION")
     print("=" * 60)
-    
-    test_df = pd.read_csv(TEST_CSV)
-    X_face_test = []
-    skipped_test = 0
-    
-    for idx, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Testing"):
-        video_path = os.path.join(DATASET_PATH, row['vid_path'].replace('\\', '/'))
-        
-        if not os.path.exists(video_path):
-            skipped_test += 1
-            continue
-        
-        faces = extract_face_from_video(video_path)
-        if faces is not None:
-            X_face_test.append(faces)
-        else:
-            skipped_test += 1
-    
-    X_face_test = np.array(X_face_test, dtype=np.float32)
-    print(f"\n✅ X_face_test: {X_face_test.shape}")
-    print(f"⚠️  Skipped: {skipped_test}")
-    
-    # Save
-    np.save(os.path.join(LANDMARKS_PATH, "X_face_train.npy"), X_face_train)
-    np.save(os.path.join(LANDMARKS_PATH, "X_face_test.npy"), X_face_test)
-    
-    print("\n✅ Facial landmarks saved!")
-    print(f"   - X_face_train.npy ({X_face_train.shape})")
-    print(f"   - X_face_test.npy ({X_face_test.shape})")
+    print(f"Features per image: {NUM_FEATURES}")
+    print(f"Emotions: {EMOTIONS}")
+
+    X_train, y_train = process_split("train")
+    X_test, y_test = process_split("test")
+    X_val, y_val = process_split("val")
+
+    print(f"\n{'=' * 60}")
+    print("💾 SAVING LANDMARKS")
+    print(f"{'=' * 60}")
+
+    np.save(os.path.join(LANDMARKS_PATH, "X_face_train.npy"), X_train)
+    np.save(os.path.join(LANDMARKS_PATH, "y_face_train.npy"), y_train)
+    np.save(os.path.join(LANDMARKS_PATH, "X_face_test.npy"), X_test)
+    np.save(os.path.join(LANDMARKS_PATH, "y_face_test.npy"), y_test)
+    np.save(os.path.join(LANDMARKS_PATH, "X_face_val.npy"), X_val)
+    np.save(os.path.join(LANDMARKS_PATH, "y_face_val.npy"), y_val)
+
+    print(f"✅ Saved to {LANDMARKS_PATH}/")
+    print(f"   X_face_train.npy: {X_train.shape}")
+    print(f"   y_face_train.npy: {y_train.shape}")
+    print(f"   X_face_test.npy:  {X_test.shape}")
+    print(f"   y_face_test.npy:  {y_test.shape}")
+    print(f"   X_face_val.npy:   {X_val.shape}")
+    print(f"   y_face_val.npy:   {y_val.shape}")
+
+    print("\n" + "=" * 60)
+    print("✅ DONE! Next: train_emotion_model.py")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    process_dataset()
+    main()

@@ -1,15 +1,15 @@
 """
 train_emotion_model.py
-Trains a CNN model for facial expression/emotion recognition.
-Uses MediaPipe Face Mesh landmarks (468 points).
+Trains a CNN/Dense model for facial expression recognition
+using FER2013 facial landmarks (468 points per image).
 """
 
 import numpy as np
-import pandas as pd
 import os
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.utils import class_weight
+import seaborn as sns
 import tensorflow as tf
 from tensorflow import keras
 from keras import layers, models, callbacks
@@ -20,105 +20,86 @@ from keras import layers, models, callbacks
 LANDMARKS_PATH = "landmarks"
 MODELS_PATH = "models"
 
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 EPOCHS = 100
 LEARNING_RATE = 0.001
 
-NUM_FRAMES = 30
-NUM_FACE_LANDMARKS = 468
-NUM_COORDS = 3
-NUM_FEATURES = NUM_FACE_LANDMARKS * NUM_COORDS  # 1404
+NUM_FEATURES = 468 * 3  # 1404
 
-# Emotion classes (7)
-EMOTION_CLASSES = ['neutral', 'happy', 'sad', 'confused', 'urgent', 'questioning', 'angry']
+# FER2013 emotion classes (must match extraction order!)
+EMOTION_CLASSES = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
+NUM_CLASSES = len(EMOTION_CLASSES)
 
 # ============================================
 # LOAD DATA
 # ============================================
 print("=" * 60)
-print("📥 LOADING FACIAL LANDMARK DATA")
+print("📥 LOADING FER2013 FACIAL LANDMARK DATA")
 print("=" * 60)
 
 X_train = np.load(os.path.join(LANDMARKS_PATH, "X_face_train.npy"))
+y_train = np.load(os.path.join(LANDMARKS_PATH, "y_face_train.npy"))
 X_test = np.load(os.path.join(LANDMARKS_PATH, "X_face_test.npy"))
+y_test = np.load(os.path.join(LANDMARKS_PATH, "y_face_test.npy"))
+X_val = np.load(os.path.join(LANDMARKS_PATH, "X_face_val.npy"))
+y_val = np.load(os.path.join(LANDMARKS_PATH, "y_face_val.npy"))
 
 print(f"X_train: {X_train.shape}")
+print(f"y_train: {y_train.shape}")
 print(f"X_test:  {X_test.shape}")
-print(f"Features per frame: {NUM_FEATURES}")
-
-# ============================================
-# CREATE EMOTION LABELS (Placeholder - you need to label your data!)
-# ============================================
-# NOTE: FSL-105 videos don't have emotion labels.
-# You need to manually label or use a pre-labeled emotion dataset.
-# For now, we'll create dummy labels for demonstration.
-
-print("\n⚠️  IMPORTANT:")
-print("FSL-105 dataset doesn't have emotion labels.")
-print("You need to either:")
-print("  1. Manually label videos with emotions")
-print("  2. Use a separate emotion dataset (FER2013, AffectNet, etc.)")
-print("  3. Create your own labeled dataset")
-print("=" * 60)
-
-# Dummy labels for now (to be replaced with real labels)
-num_train = len(X_train)
-num_test = len(X_test)
-
-# For demonstration, assign random labels (REPLACE THIS!)
-y_train = np.random.randint(0, 7, num_train)
-y_test = np.random.randint(0, 7, num_test)
-
-print(f"\ny_train (dummy): {y_train.shape}")
-print(f"y_test (dummy):  {y_test.shape}")
-print("⚠️  These are DUMMY labels - replace with real emotion labels!")
+print(f"y_test:  {y_test.shape}")
+print(f"X_val:   {X_val.shape}")
+print(f"y_val:   {y_val.shape}")
+print(f"Features per image: {NUM_FEATURES}")
+print(f"Classes: {EMOTION_CLASSES}")
 
 # ============================================
 # ONE-HOT ENCODE
 # ============================================
-NUM_CLASSES = len(EMOTION_CLASSES)
 y_train_cat = keras.utils.to_categorical(y_train, NUM_CLASSES)
 y_test_cat = keras.utils.to_categorical(y_test, NUM_CLASSES)
+y_val_cat = keras.utils.to_categorical(y_val, NUM_CLASSES)
 
 # ============================================
-# CLASS WEIGHTS
+# CLASS WEIGHTS (FER2013 is imbalanced)
 # ============================================
+print("\n" + "=" * 60)
+print("⚖️  COMPUTING CLASS WEIGHTS")
+print("=" * 60)
+
 class_weights = class_weight.compute_class_weight(
     'balanced', classes=np.unique(y_train), y=y_train
 )
 class_weight_dict = dict(enumerate(class_weights))
+print(f"✅ Range: {min(class_weights):.2f} - {max(class_weights):.2f}")
+for i, w in class_weight_dict.items():
+    print(f"   {EMOTION_CLASSES[i]:10s}: {w:.3f}")
 
 # ============================================
-# BUILD CNN MODEL FOR EMOTION
+# BUILD MODEL (Dense MLP for single images)
 # ============================================
 print("\n" + "=" * 60)
-print("🏗️  BUILDING CNN EMOTION MODEL")
+print("🏗️  BUILDING EMOTION MODEL (MLP)")
 print("=" * 60)
 
 model = models.Sequential([
-    layers.Input(shape=(NUM_FRAMES, NUM_FEATURES)),
-    
-    # 1D CNN layers for temporal face landmark patterns
-    layers.Conv1D(64, kernel_size=3, activation='relu', padding='same'),
-    layers.MaxPooling1D(pool_size=2),
-    layers.Dropout(0.3),
-    
-    layers.Conv1D(128, kernel_size=3, activation='relu', padding='same'),
-    layers.MaxPooling1D(pool_size=2),
-    layers.Dropout(0.3),
-    
-    # LSTM for temporal emotion sequence
-    layers.LSTM(128, return_sequences=False),
-    layers.Dropout(0.3),
-    
-    # Dense layers
+    layers.Input(shape=(NUM_FEATURES,)),
+
+    layers.Dense(512, activation='relu'),
+    layers.BatchNormalization(),
+    layers.Dropout(0.4),
+
     layers.Dense(256, activation='relu'),
+    layers.BatchNormalization(),
     layers.Dropout(0.4),
+
     layers.Dense(128, activation='relu'),
-    layers.Dropout(0.4),
+    layers.BatchNormalization(),
+    layers.Dropout(0.3),
+
     layers.Dense(64, activation='relu'),
-    
-    # Output
+    layers.Dropout(0.3),
+
     layers.Dense(NUM_CLASSES, activation='softmax')
 ])
 
@@ -137,11 +118,11 @@ os.makedirs(MODELS_PATH, exist_ok=True)
 
 callbacks_list = [
     callbacks.EarlyStopping(
-        monitor='val_accuracy', patience=25,
+        monitor='val_accuracy', patience=15,
         restore_best_weights=True, verbose=1
     ),
     callbacks.ReduceLROnPlateau(
-        monitor='val_loss', factor=0.5, patience=8,
+        monitor='val_loss', factor=0.5, patience=5,
         min_lr=1e-6, verbose=1
     ),
     callbacks.ModelCheckpoint(
@@ -151,7 +132,7 @@ callbacks_list = [
 ]
 
 # ============================================
-# TRAIN
+# TRAIN (use val split as validation)
 # ============================================
 print("\n" + "=" * 60)
 print("🚀 TRAINING EMOTION MODEL")
@@ -161,7 +142,7 @@ history = model.fit(
     X_train, y_train_cat,
     batch_size=BATCH_SIZE,
     epochs=EPOCHS,
-    validation_split=0.2,
+    validation_data=(X_val, y_val_cat),
     callbacks=callbacks_list,
     class_weight=class_weight_dict,
     verbose=1
@@ -171,7 +152,7 @@ history = model.fit(
 # EVALUATE
 # ============================================
 print("\n" + "=" * 60)
-print("📊 EVALUATING EMOTION MODEL")
+print("📊 EVALUATING ON TEST SET")
 print("=" * 60)
 
 test_loss, test_acc = model.evaluate(X_test, y_test_cat, verbose=1)
@@ -185,12 +166,30 @@ y_pred = model.predict(X_test)
 y_pred_classes = np.argmax(y_pred, axis=1)
 y_true_classes = np.argmax(y_test_cat, axis=1)
 
+overall_acc = accuracy_score(y_true_classes, y_pred_classes)
+print(f"\n🎯 Overall Accuracy: {overall_acc*100:.2f}%")
+
 print("\n📋 Classification Report:")
 print(classification_report(
     y_true_classes, y_pred_classes,
     target_names=EMOTION_CLASSES,
     zero_division=0
 ))
+
+# ============================================
+# CONFUSION MATRIX
+# ============================================
+cm = confusion_matrix(y_true_classes, y_pred_classes)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=EMOTION_CLASSES,
+            yticklabels=EMOTION_CLASSES)
+plt.title('Emotion Confusion Matrix')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.tight_layout()
+plt.savefig(os.path.join(MODELS_PATH, 'emotion_confusion_matrix.png'), dpi=150)
+print(f"✅ Saved to {MODELS_PATH}/emotion_confusion_matrix.png")
 
 # ============================================
 # TRAINING PLOTS
@@ -215,7 +214,7 @@ ax2.grid(True)
 
 plt.tight_layout()
 plt.savefig(os.path.join(MODELS_PATH, 'emotion_training_history.png'), dpi=150)
-print(f"\n✅ Saved plot to {MODELS_PATH}/emotion_training_history.png")
+print(f"✅ Saved plot to {MODELS_PATH}/emotion_training_history.png")
 
 # ============================================
 # SAVE
@@ -228,8 +227,4 @@ print("✅ EMOTION MODEL TRAINING COMPLETE!")
 print("=" * 60)
 print(f"Test Accuracy: {test_acc*100:.2f}%")
 print(f"Model: {MODELS_PATH}/emotion_model.h5")
-print("\n⚠️  REMINDER: This used DUMMY labels!")
-print("For real emotion recognition, you need labeled data:")
-print("  1. FER2013 dataset (7 emotions)")
-print("  2. AffectNet dataset")
-print("  3. Your own FSL emotion-labeled videos")
+print("Next step: convert_to_tflite.py")
