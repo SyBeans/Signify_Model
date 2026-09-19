@@ -18,7 +18,7 @@ from keras import layers, models, callbacks
 # CONFIGURATION
 # ============================================
 LANDMARKS_PATH = "landmarks/hand"
-MODELS_PATH = "models"
+MODELS_PATH = "models/hand"
 LABELS_CSV = "datasets/FSL/labels.csv"
 
 BATCH_SIZE = 32

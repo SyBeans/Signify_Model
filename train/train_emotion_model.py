@@ -18,7 +18,7 @@ from keras import layers, models, callbacks
 # CONFIGURATION
 # ============================================
 LANDMARKS_PATH = "landmarks/face"
-MODELS_PATH = "models"
+MODELS_PATH = "models/face"
 
 BATCH_SIZE = 64
 EPOCHS = 100
