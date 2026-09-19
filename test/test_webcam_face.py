@@ -134,14 +134,11 @@ while True:
         face_detected = True
         face_landmarks = results.multi_face_landmarks[0]
 
-        mp_draw.draw_landmarks(
-            frame, face_landmarks,
-            mp_face_mesh.FACEMESH_TESSELATION,
-            landmark_drawing_spec=None,
-            connection_drawing_spec=mp_draw.DrawingSpec(
-                color=(0, 255, 0), thickness=1, circle_radius=1
-            )
-        )
+                # Draw ONLY dots (no connection lines)
+        for lm in face_landmarks.landmark:
+            cx, cy = int(lm.x * w), int(lm.y * h)
+            if 0 <= cx < w and 0 <= cy< h:
+                frame[cy,cx] = (0,255,0)
 
         # Extract landmarks
         landmarks = []
