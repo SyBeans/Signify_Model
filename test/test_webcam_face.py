@@ -14,7 +14,7 @@ import os
 # ============================================
 # CONFIGURATION
 # ============================================
-MODEL_PATH = "models/emotion_model.h5"
+MODEL_PATH = "models/face/emotion_model.h5"
 
 EMOTION_CLASSES = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
 EMOTION_ICONS = {

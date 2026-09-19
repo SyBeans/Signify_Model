@@ -37,12 +37,16 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_detection_confidence=0.3
 )
 
-
 def extract_face_landmarks(image_path):
-    """Extract 468 face landmarks from a single image."""
+    """Extract 468 face landmarks from an image (with upscaling)."""
     img = cv2.imread(image_path)
     if img is None:
         return None
+
+    # ✅ UPSCALE small FER2013 images (48x48 → 192x192) for better MediaPipe
+    h, w = img.shape[:2]
+    if w < 100 or h < 100:
+        img = cv2.resize(img, (192, 192), interpolation=cv2.INTER_CUBIC)
 
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(img_rgb)
@@ -56,7 +60,6 @@ def extract_face_landmarks(image_path):
         landmarks.extend([lm.x, lm.y, lm.z])
 
     return np.array(landmarks, dtype=np.float32)
-
 
 def process_split(split_name):
     """Process one split (train/test/val)."""
@@ -104,6 +107,7 @@ def main():
     print("📊 FER2013 FACIAL LANDMARK EXTRACTION")
     print("=" * 60)
     print(f"Features per image: {NUM_FEATURES}")
+    print(f"Upscale target: 192×192 (for small images)")
     print(f"Emotions: {EMOTIONS}")
 
     X_train, y_train = process_split("train")
