@@ -1,7 +1,10 @@
 """
-train_model_v3_motion.py
-Trains a Bidirectional LSTM model on motion features (position + velocity).
-Now supports 2-hand input (252 features per frame).
+train_model_v3_motion.py (UPGRADED)
+Trains a Bidirectional LSTM with:
+- Data augmentation (4x training data)
+- Attention mechanism
+- Longer training (200 epochs)
+- Better learning rate schedule
 """
 
 import numpy as np
@@ -22,12 +25,14 @@ MODELS_PATH = "models/hand"
 LABELS_CSV = "datasets/FSL/labels.csv"
 
 BATCH_SIZE = 32
-EPOCHS = 100
+EPOCHS = 200                    # ← Increased from 100
 LEARNING_RATE = 0.001
 
 NUM_FRAMES = 30
-NUM_FEATURES = 252  # 63 position + 63 velocity
+NUM_FEATURES = 252
 NUM_CLASSES = 105
+
+USE_AUGMENTATION = True         # ← Toggle augmentation
 
 # ============================================
 # LOAD DATA
@@ -41,15 +46,52 @@ y_train = np.load(os.path.join(LANDMARKS_PATH, "y_train.npy"))
 X_test = np.load(os.path.join(LANDMARKS_PATH, "X_test.npy"))
 y_test = np.load(os.path.join(LANDMARKS_PATH, "y_test.npy"))
 
-print(f"X_train: {X_train.shape}, range: [{X_train.min():.3f}, {X_train.max():.3f}]")
-print(f"y_train: {y_train.shape}, unique: {len(np.unique(y_train))}")
+print(f"X_train: {X_train.shape}")
+print(f"y_train: {y_train.shape}")
 print(f"X_test:  {X_test.shape}")
 print(f"y_test:  {y_test.shape}")
 
-# Load labels
 labels_df = pd.read_csv(LABELS_CSV)
 label_names = labels_df['label'].tolist()
 print(f"📊 Classes: {len(label_names)}")
+
+# ============================================
+# DATA AUGMENTATION ✅
+# ============================================
+if USE_AUGMENTATION:
+    print("\n" + "=" * 60)
+    print("🔧 AUGMENTING TRAINING DATA (4x)")
+    print("=" * 60)
+
+    def augment_sample(sample, label):
+        """Create 3 augmented copies of a sample."""
+        augmented = [(sample, label)]  # original
+
+        # 1. Small noise
+        noise = np.random.normal(0, 0.01, sample.shape).astype(np.float32)
+        augmented.append((sample + noise, label))
+
+        # 2. Time shift
+        shift = np.random.randint(-3, 4)
+        augmented.append((np.roll(sample, shift, axis=0), label))
+
+        # 3. Scale
+        scale = np.random.uniform(0.95, 1.05)
+        augmented.append((sample * scale, label))
+
+        return augmented
+
+    np.random.seed(42)
+    X_aug, y_aug = [], []
+    for i in range(len(X_train)):
+        for s, l in augment_sample(X_train[i], y_train[i]):
+            X_aug.append(s)
+            y_aug.append(l)
+
+    X_train = np.array(X_aug, dtype=np.float32)
+    y_train = np.array(y_aug, dtype=np.int32)
+
+    print(f"✅ Original: 1,703 → Augmented: {X_train.shape[0]}")
 
 # ============================================
 # CLASS WEIGHTS
@@ -71,38 +113,44 @@ y_train_cat = keras.utils.to_categorical(y_train, NUM_CLASSES)
 y_test_cat = keras.utils.to_categorical(y_test, NUM_CLASSES)
 
 # ============================================
-# BUILD BiLSTM MODEL (Motion-Aware)
+# BUILD MODEL WITH ATTENTION ✅
 # ============================================
 print("\n" + "=" * 60)
-print("🏗️  BUILDING BiLSTM MODEL (Motion-Aware)")
+print("🏗️  BUILDING BiLSTM + ATTENTION MODEL")
 print("=" * 60)
 
-model = models.Sequential([
-    layers.Input(shape=(NUM_FRAMES, NUM_FEATURES)),
-    
-    # TimeDistributed Dense to process each frame's features
-    layers.TimeDistributed(layers.Dense(64, activation='relu')),
-    layers.Dropout(0.3),
-    
-    # Bidirectional LSTM 1
-    layers.Bidirectional(layers.LSTM(128, return_sequences=True)),
-    layers.BatchNormalization(),
-    layers.Dropout(0.3),
-    
-    # Bidirectional LSTM 2
-    layers.Bidirectional(layers.LSTM(128, return_sequences=False)),
-    layers.BatchNormalization(),
-    layers.Dropout(0.3),
-    
-    # Dense layers
-    layers.Dense(256, activation='relu'),
-    layers.Dropout(0.4),
-    layers.Dense(128, activation='relu'),
-    layers.Dropout(0.4),
-    
-    # Output
-    layers.Dense(NUM_CLASSES, activation='softmax')
-])
+inputs = layers.Input(shape=(NUM_FRAMES, NUM_FEATURES))
+
+# TimeDistributed Dense
+x = layers.TimeDistributed(layers.Dense(64, activation='relu'))(inputs)
+x = layers.Dropout(0.3)(x)
+
+# BiLSTM 1
+x = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.3)(x)
+
+# BiLSTM 2 (keep sequences for attention)
+x = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.3)(x)
+
+# ✅ Self-Attention Mechanism
+# Score each timestep
+attention_scores = layers.Dense(1, activation='tanh')(x)       # (batch, 30, 1)
+attention_weights = layers.Softmax(axis=1)(attention_scores)   # (batch, 30, 1)
+weighted = layers.Multiply()([x, attention_weights])           # (batch, 30, 256)
+x = layers.GlobalAveragePooling1D()(weighted) # (batch, 256)
+
+# Dense layers
+x = layers.Dense(256, activation='relu')(x)
+x = layers.Dropout(0.4)(x)
+x = layers.Dense(128, activation='relu')(x)
+x = layers.Dropout(0.4)(x)
+
+outputs = layers.Dense(NUM_CLASSES, activation='softmax')(x)
+
+model = models.Model(inputs=inputs, outputs=outputs)
 
 model.compile(
     optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
@@ -113,22 +161,29 @@ model.compile(
 model.summary()
 
 # ============================================
-# CALLBACKS
+# CALLBACKS (Longer patience for 200 epochs)
 # ============================================
 os.makedirs(MODELS_PATH, exist_ok=True)
 
 callbacks_list = [
     callbacks.EarlyStopping(
-        monitor='val_accuracy', patience=25,
-        restore_best_weights=True, verbose=1
+        monitor='val_accuracy',
+        patience=35,                    # ← Increased for longer training
+        restore_best_weights=True,
+        verbose=1
     ),
     callbacks.ReduceLROnPlateau(
-        monitor='val_loss', factor=0.5, patience=8,
-        min_lr=1e-6, verbose=1
+        monitor='val_loss',
+        factor=0.5,
+        patience=10,
+        min_lr=1e-7,
+        verbose=1
     ),
     callbacks.ModelCheckpoint(
         os.path.join(MODELS_PATH, 'best_model_motion.h5'),
-        monitor='val_accuracy', save_best_only=True, verbose=1
+        monitor='val_accuracy',
+        save_best_only=True,
+        verbose=1
     )
 ]
 
@@ -136,7 +191,7 @@ callbacks_list = [
 # TRAIN
 # ============================================
 print("\n" + "=" * 60)
-print("🚀 TRAINING BiLSTM MODEL (Motion-Aware)")
+print("🚀 TRAINING (Augmented + Attention)")
 print("=" * 60)
 
 history = model.fit(
@@ -170,7 +225,7 @@ y_true_classes = np.argmax(y_test_cat, axis=1)
 overall_acc = accuracy_score(y_true_classes, y_pred_classes)
 print(f"\n🎯 Overall Accuracy: {overall_acc*100:.2f}%")
 
-# Top 10 signs
+# Top/Bottom signs
 class_accs = []
 for i in range(NUM_CLASSES):
     mask = y_true_classes == i
@@ -179,49 +234,40 @@ for i in range(NUM_CLASSES):
         class_accs.append((i, label_names[i], acc, mask.sum()))
 
 class_accs.sort(key=lambda x: x[2], reverse=True)
-print("\n📋 Top 10 Signs by Accuracy:")
+print("\n📋 Top 10 Signs:")
 for i, (cid, name, acc, cnt) in enumerate(class_accs[:10]):
-    print(f"  {i+1}. {name:20s} → {acc*100:5.1f}% ({cnt} samples)")
+    print(f"  {i+1}. {name:20s} → {acc*100:5.1f}% ({cnt})")
 
-# Bottom 10 signs
-print("\n📋 Bottom 10 Signs (Most Confused):")
-for i, (cid, name, acc, cnt) in enumerate(class_accs[-10:]):
-    print(f"  {name:20s} → {acc*100:5.1f}% ({cnt} samples)")
+print("\n📋 Bottom 10 Signs:")
+for name, acc, cnt in [(n, a, c) for _, n, a, c in class_accs[-10:]]:
+    print(f"  {name:20s} → {acc*100:5.1f}% ({cnt})")
 
 # ============================================
-# TRAINING PLOTS
+# PLOTS
 # ============================================
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
 ax1.plot(history.history['accuracy'], label='Train')
 ax1.plot(history.history['val_accuracy'], label='Validation')
-ax1.set_title('Model Accuracy (Motion-Aware)')
-ax1.set_xlabel('Epoch')
-ax1.set_ylabel('Accuracy')
-ax1.legend()
-ax1.grid(True)
+ax1.set_title('Accuracy (Augmented + Attention)')
+ax1.legend(); ax1.grid(True)
 
 ax2.plot(history.history['loss'], label='Train')
 ax2.plot(history.history['val_loss'], label='Validation')
-ax2.set_title('Model Loss (Motion-Aware)')
-ax2.set_xlabel('Epoch')
-ax2.set_ylabel('Loss')
-ax2.legend()
-ax2.grid(True)
+ax2.set_title('Loss (Augmented + Attention)')
+ax2.legend(); ax2.grid(True)
 
 plt.tight_layout()
-plt.savefig(os.path.join(MODELS_PATH, 'training_history_motion.png'), dpi=150)
-print(f"\n✅ Saved plot to {MODELS_PATH}/training_history_motion.png")
+plt.savefig(os.path.join(MODELS_PATH, 'training_history_v4.png'), dpi=150)
+print(f"✅ Saved plot")
 
 # ============================================
 # SAVE
 # ============================================
-model.save(os.path.join(MODELS_PATH, 'sign_model_motion.h5'))
-print(f"✅ Saved model to {MODELS_PATH}/sign_model_motion.h5")
+model.save(os.path.join(MODELS_PATH, 'sign_model_v4.h5'))
+print(f"✅ Saved to {MODELS_PATH}/sign_model_v4.h5")
 
 print("\n" + "=" * 60)
 print("✅ TRAINING COMPLETE!")
 print("=" * 60)
 print(f"Test Accuracy: {test_acc*100:.2f}%")
-print(f"Model: {MODELS_PATH}/sign_model_motion.h5")
-print(f"Next step: python convert_to_tflite.py")
+print(f"Model: {MODELS_PATH}/sign_model_v4.h5")
