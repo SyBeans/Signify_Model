@@ -1,7 +1,11 @@
 """
 test_webcam_face.py
-Real-time facial emotion recognition using webcam.
-Uses MediaPipe Face Mesh + trained emotion model with relative features.
+Real-time facial emotion recognition — HYBRID pipeline.
+
+MediaPipe Face Mesh = DETECTOR (finds face, gives bbox)
+Lean CNN (FER+ 48x48) = CLASSIFIER (predicts emotion)
+
+Matches train_emotion_cnn_ferplus.py
 """
 
 import cv2
@@ -9,14 +13,12 @@ import numpy as np
 import mediapipe as mp
 import tensorflow as tf
 from collections import deque
-from sklearn.preprocessing import StandardScaler
 import os
 
 # ============================================
 # CONFIGURATION
 # ============================================
-MODEL_PATH = "models/face/emotion_model.h5"
-TRAIN_DATA_PATH = "landmarks/face/X_face_train.npy"
+MODEL_PATH = "models/face_hybrid/emotion_cnn.h5"
 
 EMOTION_CLASSES = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
 EMOTION_ICONS = {
@@ -29,61 +31,24 @@ EMOTION_COLORS = {
     "neutral": (200, 200, 200)
 }
 
-# Key landmark pairs (same as training!)
-KEY_PAIRS = [
-    (61, 291), (13, 14), (33, 133), (362, 263), (105, 334), (293, 334),
-    (61, 13), (291, 13), (61, 14), (291, 14), (33, 362), (13, 168),
-]
+IMG_SIZE = 48
+CROP_MARGIN = 0.15   # 15% padding around landmark bbox (match FER+ tight framing)
 
 # ============================================
-# FEATURE ENGINEERING (must match training!)
-# ============================================
-def add_relative_features(X):
-    N = X.shape[0]
-    X_reshaped = X.reshape(N, 468, 3)
-
-    rel_features = []
-    for i, j in KEY_PAIRS:
-        diff = X_reshaped[:, i, :] - X_reshaped[:, j, :]
-        dist = np.linalg.norm(diff, axis=1)
-        rel_features.append(dist.reshape(N, 1))
-
-    mouth_h = np.linalg.norm(X_reshaped[:, 13] - X_reshaped[:, 14], axis=1, keepdims=True)
-    mouth_w = np.linalg.norm(X_reshaped[:, 61] - X_reshaped[:, 291], axis=1, keepdims=True)
-    mar = mouth_h / (mouth_w + 1e-6)
-
-    eye_l = np.linalg.norm(X_reshaped[:, 33] - X_reshaped[:, 133], axis=1, keepdims=True)
-    eye_r = np.linalg.norm(X_reshaped[:, 362] - X_reshaped[:, 263], axis=1, keepdims=True)
-    ear = (eye_l + eye_r) / 2.0
-
-    rel_features.append(mar)
-    rel_features.append(ear)
-
-    rel_features = np.concatenate(rel_features, axis=1)
-    return np.concatenate([X, rel_features], axis=1)
-
-# ============================================
-# LOAD MODEL & SCALER
+# LOAD MODEL
 # ============================================
 print("=" * 50)
-print("📥 Loading emotion model...")
+print("📥 Loading emotion CNN...")
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
 model = tf.keras.models.load_model(MODEL_PATH)
 print(f"✅ Model loaded! Classes: {EMOTION_CLASSES}")
-
-print("📥 Setting up scaler (from training data)...")
-X_train_raw = np.load(TRAIN_DATA_PATH)
-X_train_with_rel = add_relative_features(X_train_raw)
-scaler = StandardScaler()
-scaler.fit(X_train_with_rel)
-print(f"✅ Scaler ready! Expects {X_train_with_rel.shape[1]} features")
 print("=" * 50)
 
 # ============================================
-# INITIALIZE MEDIAPIPE FACE MESH
+# MEDIAPIPE FACE MESH (detector only)
 # ============================================
 mp_face_mesh = mp.solutions.face_mesh
-mp_draw = mp.solutions.drawing_utils
-
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=False,
     max_num_faces=1,
@@ -93,19 +58,16 @@ face_mesh = mp_face_mesh.FaceMesh(
 )
 
 # ============================================
-# WEBCAM SETUP
+# WEBCAM
 # ============================================
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 print("\n🎥 Webcam started!")
-print("=" * 50)
-print("🖐️  INSTRUCTIONS:")
 print("  1. Look at the camera")
 print("  2. Make facial expressions!")
-print("  3. Hold expression for 1-2 seconds")
-print("  4. Press 'Q' to quit")
+print("  3. Press 'Q' to quit")
 print("=" * 50)
 
 # ============================================
@@ -129,38 +91,54 @@ while True:
 
     results = face_mesh.process(frame_rgb)
     face_detected = False
+    bbox = None
 
     if results.multi_face_landmarks:
         face_detected = True
         face_landmarks = results.multi_face_landmarks[0]
 
-                # Draw ONLY dots (no connection lines)
+        # --- bounding box from landmarks ---
+        xs = [lm.x for lm in face_landmarks.landmark]
+        ys = [lm.y for lm in face_landmarks.landmark]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+
+        # add margin
+        bw = x_max - x_min
+        bh = y_max - y_min
+        x_min = max(0.0, x_min - bw * CROP_MARGIN)
+        x_max = min(1.0, x_max + bw * CROP_MARGIN)
+        y_min = max(0.0, y_min - bh * CROP_MARGIN)
+        y_max = min(1.0, y_max + bh * CROP_MARGIN)
+
+        px1, py1 = int(x_min * w), int(y_min * h)
+        px2, py2 = int(x_max * w), int(y_max * h)
+        bbox = (px1, py1, px2, py2)
+
+        # --- draw dots ---
         for lm in face_landmarks.landmark:
             cx, cy = int(lm.x * w), int(lm.y * h)
-            if 0 <= cx < w and 0 <= cy< h:
-                frame[cy,cx] = (0,255,0)
+            if 0 <= cx < w and 0 <= cy < h:
+                frame[cy, cx] = (0, 255, 0)
 
-        # Extract landmarks
-        landmarks = []
-        for lm in face_landmarks.landmark:
-            landmarks.extend([lm.x, lm.y, lm.z])
+        # --- crop + preprocess ---
+        crop = frame[py1:py2, px1:px2]
+        if crop.size > 0:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE))
+            inp = gray.astype(np.float32) / 255.0
+            inp = inp.reshape(1, IMG_SIZE, IMG_SIZE, 1)
 
-        # ✅ Add relative features + normalize
-        input_data = np.array([landmarks], dtype=np.float32)
-        input_data = add_relative_features(input_data)
-        input_data = scaler.transform(input_data).astype(np.float32)
+            prediction = model.predict(inp, verbose=0)[0]
+            predicted_class = int(np.argmax(prediction))
+            conf = float(prediction[predicted_class]) * 100
 
-        # Predict
-        prediction = model.predict(input_data, verbose=0)[0]
-        predicted_class = np.argmax(prediction)
-        conf = prediction[predicted_class] * 100
+            prediction_buffer.append(predicted_class)
 
-        prediction_buffer.append(predicted_class)
-
-        if len(prediction_buffer) > 0:
-            most_common = max(set(prediction_buffer), key=prediction_buffer.count)
-            current_emotion = EMOTION_CLASSES[most_common]
-            confidence = conf
+            if len(prediction_buffer) > 0:
+                most_common = max(set(prediction_buffer), key=prediction_buffer.count)
+                current_emotion = EMOTION_CLASSES[most_common]
+                confidence = conf
     else:
         prediction_buffer.clear()
         current_emotion = "No face detected"
@@ -169,6 +147,11 @@ while True:
     # ============================================
     # DISPLAY
     # ============================================
+    if bbox is not None:
+        px1, py1, px2, py2 = bbox
+        color = EMOTION_COLORS.get(current_emotion, (255, 255, 255))
+        cv2.rectangle(frame, (px1, py1), (px2, py2), color, 2)
+
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, 130), (0, 0, 0), -1)
     frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
@@ -192,7 +175,7 @@ while True:
     cv2.putText(frame, "Press 'Q' to quit",
                 (15, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-    cv2.imshow('Signify - Emotion Test', frame)
+    cv2.imshow('Signify - Emotion Test (Hybrid CNN)', frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
