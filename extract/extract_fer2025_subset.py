@@ -29,7 +29,7 @@ OUTPUT_PATH = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025")
 
 IMG_SIZE = 48
 CROP_MARGIN = 0.15
-IMAGES_PER_CLASS = 6000     # ← 5k per class
+IMAGES_PER_CLASS = 6000     # ← 6k per class
 TRAIN_RATIO = 0.80
 VAL_RATIO = 0.10
 TEST_RATIO = 0.10
@@ -143,7 +143,7 @@ def process_tar(tar_path, class_name, max_images):
 # MAIN
 # ============================================
 print("=" * 60)
-print("📥 EXTRACTING FER2025 SUBSET (5k/class)")
+print("📥 EXTRACTING FER2025 SUBSET (6k/class)")
 print("=" * 60)
 
 all_X, all_y = [], []
