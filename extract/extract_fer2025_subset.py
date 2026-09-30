@@ -1,16 +1,17 @@
 """
-extract_fer2025_subset.py
+extract_fer2025_subset.py  (v2 — better crop)
 
-Reads FER2025 TAR files, takes 5k images per class, extracts MediaPipe
-Face Mesh landmarks, crops faces, resizes to 48x48 grayscale.
+Reads FER2025 TAR files, takes 6k images per class, extracts MediaPipe
+Face Mesh landmarks, crops faces with EXTENDED forehead margin and
+ASPECT-PRESERVING square crop, resizes to 48x48 grayscale.
 
 Output: landmarks/fer2025/
-  X_train.npy  (28000, 48, 48, 1)
-  y_train.npy  (28000,)
-  X_val.npy    (3500, 48, 48, 1)
-  y_val.npy    (3500,)
-  X_test.npy   (3500, 48, 48, 1)
-  y_test.npy   (3500,)
+  X_train.npy  (33600, 48, 48, 1)
+  y_train.npy  (33600,)
+  X_val.npy    (4800, 48, 48, 1)
+  y_val.npy    (4800,)
+  X_test.npy   (4800, 48, 48, 1)
+  y_test.npy   (4800,)
 """
 
 import os
@@ -28,8 +29,7 @@ FER2025_PATH = os.path.expanduser("~/Signify/Signify_Model/datasets/FER2025")
 OUTPUT_PATH = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025")
 
 IMG_SIZE = 48
-CROP_MARGIN = 0.15
-IMAGES_PER_CLASS = 6000     # ← 6k per class
+IMAGES_PER_CLASS = 6000
 TRAIN_RATIO = 0.80
 VAL_RATIO = 0.10
 TEST_RATIO = 0.10
@@ -55,9 +55,14 @@ face_mesh = mp_face_mesh.FaceMesh(
 )
 
 # ============================================
-# FACE CROP + RESIZE
+# ✅ IMPROVED FACE CROP
 # ============================================
 def extract_face_crop(image_bgr):
+    """Extract face crop with:
+    - SQUARE bounding box (no aspect distortion)
+    - Bigger margin (1.35x)
+    - Extra forehead room (0.55 top vs 0.45 bottom)
+    """
     h, w = image_bgr.shape[:2]
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(rgb)
@@ -69,15 +74,19 @@ def extract_face_crop(image_bgr):
     xs = [p.x for p in lm.landmark]
     ys = [p.y for p in lm.landmark]
 
-    x_min, x_max = min(xs), max(xs)
-    y_min, y_max = min(ys), max(ys)
-    bw = x_max - x_min
-    bh = y_max - y_min
+    x_min_raw, x_max_raw = min(xs), max(xs)
+    y_min_raw, y_max_raw = min(ys), max(ys)
 
-    x_min = max(0.0, x_min - bw * CROP_MARGIN)
-    x_max = min(1.0, x_max + bw * CROP_MARGIN)
-    y_min = max(0.0, y_min - bh * CROP_MARGIN)
-    y_max = min(1.0, y_max + bh * CROP_MARGIN)
+    # Center + square extent
+    cx = (x_min_raw + x_max_raw) / 2
+    cy = (y_min_raw + y_max_raw) / 2
+    size = max(x_max_raw - x_min_raw, y_max_raw - y_min_raw) * 1.35
+
+    # Extra forehead (top 55%) vs chin (bottom 45%)
+    y_min = max(0.0, cy - size * 0.55)
+    y_max = min(1.0, cy + size * 0.45)
+    x_min = max(0.0, cx - size * 0.50)
+    x_max = min(1.0, cx + size * 0.50)
 
     px1, py1 = int(x_min * w), int(y_min * h)
     px2, py2 = int(x_max * w), int(y_max * h)
@@ -90,7 +99,7 @@ def extract_face_crop(image_bgr):
         return None
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE))
+    gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
     return gray
 
 # ============================================
@@ -104,7 +113,6 @@ def process_tar(tar_path, class_name, max_images):
     label = CLASS_TO_ID[class_name]
 
     with tarfile.open(tar_path, "r") as tar:
-        # Only .jpg files — skips .cls automatically
         members = [m for m in tar.getmembers()
                    if m.isfile() and m.name.lower().endswith(
                        ('.jpg', '.jpeg', '.png'))]
@@ -143,7 +151,7 @@ def process_tar(tar_path, class_name, max_images):
 # MAIN
 # ============================================
 print("=" * 60)
-print("📥 EXTRACTING FER2025 SUBSET (6k/class)")
+print("📥 EXTRACTING FER2025 (6k/class, improved crop)")
 print("=" * 60)
 
 all_X, all_y = [], []
