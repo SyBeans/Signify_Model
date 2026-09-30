@@ -1,11 +1,10 @@
 """
 test_webcam_face.py
-Real-time facial emotion recognition — HYBRID pipeline.
+Real-time facial emotion recognition — HYBRID pipeline with FSL mapping.
 
-MediaPipe Face Mesh = DETECTOR (finds face, gives bbox)
-Lean CNN (FER+ 48x48) = CLASSIFIER (predicts emotion)
-
-Matches train_emotion_cnn_ferplus.py
+MediaPipe Face Mesh  = DETECTOR (finds face, gives bbox)
+Lean CNN (FER+ 48x48) = CLASSIFIER (predicts raw FER+ emotion)
+FERPLUS_TO_FSL        = MAPPING (translates FER+ → FSL emotions for Signify)
 """
 
 import cv2
@@ -20,19 +19,48 @@ import os
 # ============================================
 MODEL_PATH = "models/face_hybrid/emotion_cnn.h5"
 
-EMOTION_CLASSES = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
-EMOTION_ICONS = {
-    "angry": "😠", "disgust": "🤢", "fear": "😨",
-    "happy": "😊", "sad": "😢", "surprise": "😲", "neutral": "😐"
+# Raw FER+ classes (what the CNN was trained on, order matters!)
+FERPLUS_CLASSES = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
+
+# FER+ → FSL mapping (what Signify displays)
+FERPLUS_TO_FSL = {
+    "neutral":   "Neutral",
+    "happy":     "Happy",
+    "sad":       "Sad",
+    "angry":     "Angry",
+    "surprise":  "Questioning",
+    "fear":      "Urgent",
+    "disgust":   "Angry",
 }
-EMOTION_COLORS = {
-    "angry": (0, 0, 255), "disgust": (0, 128, 0), "fear": (128, 0, 128),
-    "happy": (0, 255, 255), "sad": (255, 0, 0), "surprise": (0, 165, 255),
-    "neutral": (200, 200, 200)
+
+# FSL display assets
+FSL_ICONS = {
+    "Neutral":     "😐",
+    "Happy":       "😊",
+    "Sad":         "😢",
+    "Angry":       "😠",
+    "Questioning": "🤔",
+    "Urgent":      "🚨",
+}
+FSL_COLORS = {
+    "Neutral":     (200, 200, 200),
+    "Happy":       (0, 255, 255),
+    "Sad":         (255, 0, 0),
+    "Angry":       (0, 0, 255),
+    "Questioning": (255, 200, 0),
+    "Urgent":      (0, 100, 255),
+}
+FSL_PUNCTUATION = {
+    "Neutral":     ".",
+    "Happy":       "!",
+    "Sad":         ".",
+    "Angry":       "!",
+    "Questioning": "?",
+    "Urgent":      "!",
 }
 
 IMG_SIZE = 48
-CROP_MARGIN = 0.15   # 15% padding around landmark bbox (match FER+ tight framing)
+CROP_MARGIN = 0.15
 
 # ============================================
 # LOAD MODEL
@@ -42,7 +70,9 @@ print("📥 Loading emotion CNN...")
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
 model = tf.keras.models.load_model(MODEL_PATH)
-print(f"✅ Model loaded! Classes: {EMOTION_CLASSES}")
+print(f"✅ Model loaded!")
+print(f"   FER+ classes: {FERPLUS_CLASSES}")
+print(f"   FSL classes:  {list(set(FERPLUS_TO_FSL.values()))}")
 print("=" * 50)
 
 # ============================================
@@ -71,10 +101,11 @@ print("  3. Press 'Q' to quit")
 print("=" * 50)
 
 # ============================================
-# SMOOTHING
+# SMOOTHING (on FSL emotion, after mapping)
 # ============================================
 prediction_buffer = deque(maxlen=10)
-current_emotion = "Waiting..."
+current_fsl = "Waiting..."
+current_ferplus = None
 confidence = 0.0
 
 # ============================================
@@ -103,7 +134,6 @@ while True:
         x_min, x_max = min(xs), max(xs)
         y_min, y_max = min(ys), max(ys)
 
-        # add margin
         bw = x_max - x_min
         bh = y_max - y_min
         x_min = max(0.0, x_min - bw * CROP_MARGIN)
@@ -130,18 +160,24 @@ while True:
             inp = inp.reshape(1, IMG_SIZE, IMG_SIZE, 1)
 
             prediction = model.predict(inp, verbose=0)[0]
-            predicted_class = int(np.argmax(prediction))
-            conf = float(prediction[predicted_class]) * 100
+            raw_class_idx = int(np.argmax(prediction))
+            conf = float(prediction[raw_class_idx]) * 100
 
-            prediction_buffer.append(predicted_class)
+            raw_emotion = FERPLUS_CLASSES[raw_class_idx]
+            fsl_emotion = FERPLUS_TO_FSL[raw_emotion]
+
+            # Smooth on FSL label (not raw), so disgust+angry votes combine
+            prediction_buffer.append(fsl_emotion)
 
             if len(prediction_buffer) > 0:
                 most_common = max(set(prediction_buffer), key=prediction_buffer.count)
-                current_emotion = EMOTION_CLASSES[most_common]
+                current_fsl = most_common
+                current_ferplus = raw_emotion
                 confidence = conf
     else:
         prediction_buffer.clear()
-        current_emotion = "No face detected"
+        current_fsl = "No face detected"
+        current_ferplus = None
         confidence = 0.0
 
     # ============================================
@@ -149,25 +185,30 @@ while True:
     # ============================================
     if bbox is not None:
         px1, py1, px2, py2 = bbox
-        color = EMOTION_COLORS.get(current_emotion, (255, 255, 255))
+        color = FSL_COLORS.get(current_fsl, (255, 255, 255))
         cv2.rectangle(frame, (px1, py1), (px2, py2), color, 2)
 
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 130), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (w, 160), (0, 0, 0), -1)
     frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
 
-    if face_detected and current_emotion in EMOTION_ICONS:
-        icon = EMOTION_ICONS[current_emotion]
-        color = EMOTION_COLORS[current_emotion]
+    if face_detected and current_fsl in FSL_ICONS:
+        icon = FSL_ICONS[current_fsl]
+        color = FSL_COLORS[current_fsl]
+        punct = FSL_PUNCTUATION[current_fsl]
 
-        cv2.putText(frame, f"Emotion: {current_emotion.upper()} {icon}",
+        cv2.putText(frame, f"FSL: {current_fsl.upper()} {icon} {punct}",
                     (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 3)
+        cv2.putText(frame, f"FER+ raw: {current_ferplus}",
+                    (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (180, 180, 180), 1)
         cv2.putText(frame, f"Confidence: {confidence:.1f}%",
-                    (15, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    (255, 255, 255), 2)
 
         bar_w = int((confidence / 100) * (w - 30))
-        cv2.rectangle(frame, (15, 100), (15 + bar_w, 115), color, -1)
-        cv2.rectangle(frame, (15, 100), (w - 15, 115), (255, 255, 255), 2)
+        cv2.rectangle(frame, (15, 125), (15 + bar_w, 140), color, -1)
+        cv2.rectangle(frame, (15, 125), (w - 15, 140), (255, 255, 255), 2)
     else:
         cv2.putText(frame, "No face detected",
                     (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
@@ -175,7 +216,7 @@ while True:
     cv2.putText(frame, "Press 'Q' to quit",
                 (15, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-    cv2.imshow('Signify - Emotion Test (Hybrid CNN)', frame)
+    cv2.imshow('Signify - Emotion Test (FSL mapped)', frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
