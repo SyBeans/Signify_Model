@@ -1,5 +1,9 @@
 """
-train_emotion_resnet.py  (CPU-OPTIMIZED)
+train_emotion_resnet.py  (v2 — Mixup + stronger aug + ensemble-ready)
+
+Fixes overfitting from v1 (train 76% / val 61%).
+Adds: Mixup, zoom aug, light erasing, higher dropout, higher label smoothing.
+Saves test probs for later ensemble averaging.
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -20,13 +24,13 @@ tf.config.threading.set_inter_op_parallelism_threads(8)
 tf.config.threading.set_intra_op_parallelism_threads(8)
 
 # ============================================
-# CONFIG (CPU-OPTIMIZED)
+# CONFIG
 # ============================================
 DATA_PATH   = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025")
 MODELS_PATH = "models/face_fer2025"
 IMG_SIZE    = 48
-BATCH_SIZE  = 64
-EPOCHS      = 60
+BATCH_SIZE  = 96
+EPOCHS      = 45
 BASE_LR     = 2e-3
 SEED        = int(os.environ.get("SEED", 42))
 
@@ -56,11 +60,27 @@ y_val_cat   = keras.utils.to_categorical(y_val,   NUM_CLASSES).astype(np.float32
 y_test_cat  = keras.utils.to_categorical(y_test,  NUM_CLASSES).astype(np.float32)
 
 # ============================================
-# AUGMENTATION (CPU-friendly)
+# AUGMENTATION (stronger, still CPU-friendly)
 # ============================================
 def augment(image, label):
     image = tf.image.random_flip_left_right(image)
-    image = tf.image.random_brightness(image, max_delta=0.10)
+    image = tf.image.random_brightness(image, max_delta=0.12)
+    image = tf.image.random_contrast(image, 0.85, 1.15)
+
+    # Zoom
+    image = tf.image.resize_with_crop_or_pad(image, IMG_SIZE + 6, IMG_SIZE + 6)
+    image = tf.image.random_crop(image, size=[IMG_SIZE, IMG_SIZE, 1])
+
+    # Light erasing (10%)
+    if tf.random.uniform([]) < 0.10:
+        eh = tf.random.uniform([], 4, 7, dtype=tf.int32)
+        ew = tf.random.uniform([], 4, 7, dtype=tf.int32)
+        ey = tf.random.uniform([], 0, IMG_SIZE - eh, dtype=tf.int32)
+        ex = tf.random.uniform([], 0, IMG_SIZE - ew, dtype=tf.int32)
+        mask = tf.pad(tf.ones([eh, ew, 1]),
+                      [[ey, IMG_SIZE-eh-ey], [ex, IMG_SIZE-ew-ex], [0, 0]])
+        image = image * (1.0 - mask)
+
     return tf.clip_by_value(image, 0.0, 1.0), label
 
 AUTOTUNE = tf.data.AUTOTUNE
@@ -68,15 +88,31 @@ AUTOTUNE = tf.data.AUTOTUNE
 def build_ds(X, y, bs, augment_data=False, shuffle=False):
     ds = tf.data.Dataset.from_tensor_slices((X, y))
     if shuffle:
-        ds = ds.shuffle(min(len(X), 5000), seed=SEED)
+        ds = ds.shuffle(min(len(X), 8000), seed=SEED)
     if augment_data:
         ds = ds.map(augment, num_parallel_calls=2)
-    ds = ds.batch(bs).prefetch(2)
-    return ds
+    return ds.batch(bs).prefetch(2)
 
 train_ds = build_ds(X_train, y_train_cat, BATCH_SIZE, True, True)
 val_ds   = build_ds(X_val,   y_val_cat,   BATCH_SIZE, False, False)
 test_ds  = build_ds(X_test,  y_test_cat,  BATCH_SIZE, False, False)
+
+# ============================================
+# MIXUP
+# ============================================
+def mixup_batch(images, labels, alpha=0.2):
+    batch_size = tf.shape(images)[0]
+    lam = tf.random.uniform([], 0.0, 1.0, dtype=tf.float32)
+    lam = tf.maximum(lam, 1.0 - lam)
+    idx = tf.random.shuffle(tf.range(batch_size))
+    images = tf.cast(images, tf.float32)
+    labels = tf.cast(labels, tf.float32)
+    mixed_images = lam * images + (1.0 - lam) * tf.gather(images, idx)
+    mixed_labels = lam * labels + (1.0 - lam) * tf.gather(labels, idx)
+    return mixed_images, mixed_labels
+
+train_ds = train_ds.map(lambda x, y: mixup_batch(x, y, 0.2),
+                        num_parallel_calls=AUTOTUNE)
 
 # ============================================
 # SE BLOCK + RESIDUAL BLOCK
@@ -95,17 +131,14 @@ def residual_block(x, filters, stride=1, drop=0.0):
         shortcut = layers.Conv2D(filters, 1, strides=stride,
                                  padding='same', use_bias=False)(x)
         shortcut = layers.BatchNormalization()(shortcut)
-
     x = layers.Conv2D(filters, 3, strides=stride, padding='same',
                       use_bias=False,
                       kernel_regularizer=regularizers.l2(1e-4))(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation('relu')(x)
-
     x = layers.Conv2D(filters, 3, padding='same', use_bias=False,
                       kernel_regularizer=regularizers.l2(1e-4))(x)
     x = layers.BatchNormalization()(x)
-
     x = se_block(x)
     x = layers.Add()([x, shortcut])
     x = layers.Activation('relu')(x)
@@ -114,9 +147,9 @@ def residual_block(x, filters, stride=1, drop=0.0):
     return x
 
 # ============================================
-# BUILD MODEL (smaller)
+# BUILD MODEL
 # ============================================
-print("\n" + "=" * 60); print("🏗️  BUILDING MINI-RESNET (CPU)"); print("=" * 60)
+print("\n" + "=" * 60); print("🏗️  BUILDING MINI-RESNET (v2)"); print("=" * 60)
 
 inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 1))
 
@@ -124,32 +157,34 @@ x = layers.Conv2D(32, 3, padding='same', use_bias=False)(inputs)
 x = layers.BatchNormalization()(x)
 x = layers.Activation('relu')(x)
 
-x = residual_block(x, 32, drop=0.10)
-x = residual_block(x, 64, stride=2, drop=0.15)
-x = residual_block(x, 128, stride=2, drop=0.20)
-x = residual_block(x, 256, stride=2, drop=0.25)
+x = residual_block(x, 32, drop=0.15)
+x = residual_block(x, 64, stride=2, drop=0.20)
+x = residual_block(x, 128, stride=2, drop=0.25)
+x = residual_block(x, 256, stride=2, drop=0.30)
 
 x = layers.GlobalAveragePooling2D()(x)
 x = layers.Dense(128, use_bias=False)(x)
 x = layers.BatchNormalization()(x)
 x = layers.Activation('relu')(x)
-x = layers.Dropout(0.5)(x)
+x = layers.Dropout(0.6)(x)
 outputs = layers.Dense(NUM_CLASSES, activation='softmax')(x)
 
-model = models.Model(inputs, outputs, name=f"emotion_resnet_seed{SEED}")
+model = models.Model(inputs, outputs, name=f"emotion_resnet_v2_seed{SEED}")
 
 # ============================================
-# COSINE LR WITH WARMUP
+# COSINE LR WITH WARMUP + get_config
 # ============================================
 steps_per_epoch = len(train_ds)
 total_steps  = EPOCHS * steps_per_epoch
-warmup_steps = 1 * steps_per_epoch
+warmup_steps = 2 * steps_per_epoch
 
 class WarmupCosine(keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, base_lr, warmup, total, min_lr=1e-5):
         super().__init__()
-        self.base_lr = base_lr; self.warmup = warmup
-        self.total = total; self.min_lr = min_lr
+        self.base_lr = float(base_lr)
+        self.warmup  = float(warmup)
+        self.total   = float(total)
+        self.min_lr  = float(min_lr)
     def __call__(self, step):
         step = tf.cast(step, tf.float32)
         warmup = tf.cast(self.warmup, tf.float32)
@@ -160,12 +195,15 @@ class WarmupCosine(keras.optimizers.schedules.LearningRateSchedule):
         cosine_lr = self.min_lr + 0.5 * (self.base_lr - self.min_lr) * \
                     (1 + tf.cos(np.pi * progress))
         return tf.where(step < warmup, warmup_lr, cosine_lr)
+    def get_config(self):
+        return {"base_lr": self.base_lr, "warmup": self.warmup,
+                "total": self.total, "min_lr": self.min_lr}
 
 lr_schedule = WarmupCosine(BASE_LR, warmup_steps, total_steps)
 
 model.compile(
     optimizer=keras.optimizers.AdamW(learning_rate=lr_schedule, weight_decay=1e-4),
-    loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
+    loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.15),
     metrics=['accuracy']
 )
 model.summary()
@@ -173,18 +211,18 @@ model.summary()
 # ============================================
 # CALLBACKS
 # ============================================
-ckpt_path = os.path.join(MODELS_PATH, f"best_resnet_seed{SEED}.h5")
+ckpt_path = os.path.join(MODELS_PATH, f"best_resnet_v2_seed{SEED}.h5")
 callbacks_list = [
     callbacks.ModelCheckpoint(ckpt_path, monitor='val_accuracy',
                               save_best_only=True, verbose=1),
-    callbacks.EarlyStopping(monitor='val_accuracy', patience=10,
+    callbacks.EarlyStopping(monitor='val_accuracy', patience=12,
                             restore_best_weights=True, verbose=1),
 ]
 
 # ============================================
 # TRAIN
 # ============================================
-print("\n" + "=" * 60); print(f"🚀 TRAINING (seed={SEED})"); print("=" * 60)
+print("\n" + "=" * 60); print(f"🚀 TRAINING v2 (seed={SEED})"); print("=" * 60)
 
 history = model.fit(
     train_ds, validation_data=val_ds,
@@ -192,7 +230,7 @@ history = model.fit(
 )
 
 # ============================================
-# EVALUATE WITH TTA
+# EVALUATE WITH FLIP TTA
 # ============================================
 print("\n" + "=" * 60); print("📊 EVALUATING (with flip TTA)"); print("=" * 60)
 
@@ -213,14 +251,14 @@ cm = confusion_matrix(y_test, y_pred)
 plt.figure(figsize=(10, 8))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
             xticklabels=EMOTION_CLASSES, yticklabels=EMOTION_CLASSES)
-plt.title(f'Confusion Matrix (seed={SEED}, TTA acc={acc*100:.2f}%)')
+plt.title(f'Confusion Matrix v2 (seed={SEED}, TTA acc={acc*100:.2f}%)')
 plt.tight_layout()
-plt.savefig(os.path.join(MODELS_PATH, f'cm_seed{SEED}.png'), dpi=150)
+plt.savefig(os.path.join(MODELS_PATH, f'cm_v2_seed{SEED}.png'), dpi=150)
 
-model.save(os.path.join(MODELS_PATH, f'emotion_resnet_seed{SEED}.h5'))
-np.save(os.path.join(MODELS_PATH, f'test_probs_seed{SEED}.npy'), y_prob)
-np.save(os.path.join(MODELS_PATH, f'val_probs_seed{SEED}.npy'),
+model.save(os.path.join(MODELS_PATH, f'emotion_resnet_v2_seed{SEED}.h5'))
+np.save(os.path.join(MODELS_PATH, f'test_probs_v2_seed{SEED}.npy'), y_prob)
+np.save(os.path.join(MODELS_PATH, f'val_probs_v2_seed{SEED}.npy'),
         predict_with_tta(model, X_val))
 
-print(f"\n✅ Saved seed {SEED} → {MODELS_PATH}/emotion_resnet_seed{SEED}.h5")
+print(f"\n✅ Saved seed {SEED} → {MODELS_PATH}/emotion_resnet_v2_seed{SEED}.h5")
 print(f"✅ Test acc: {acc*100:.2f}%")
