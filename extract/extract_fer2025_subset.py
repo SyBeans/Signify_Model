@@ -1,17 +1,17 @@
 """
-extract_fer2025_subset.py  (v2 — better crop)
+extract_fer2025_subset.py  (v3 — wider forehead crop)
 
 Reads FER2025 TAR files, takes 6k images per class, extracts MediaPipe
-Face Mesh landmarks, crops faces with EXTENDED forehead margin and
-ASPECT-PRESERVING square crop, resizes to 48x48 grayscale.
+Face Mesh landmarks, crops faces with EXTENDED forehead margin (1.55x)
+and ASPECT-PRESERVING square crop, resizes to 48x48 grayscale.
 
 Output: landmarks/fer2025/
   X_train.npy  (33600, 48, 48, 1)
   y_train.npy  (33600,)
-  X_val.npy    (4800, 48, 48, 1)
-  y_val.npy    (4800,)
-  X_test.npy   (4800, 48, 48, 1)
-  y_test.npy   (4800,)
+  X_val.npy    (4200, 48, 48, 1)
+  y_val.npy    (4200,)
+  X_test.npy   (4200, 48, 48, 1)
+  y_test.npy   (4200,)
 """
 
 import os
@@ -55,13 +55,13 @@ face_mesh = mp_face_mesh.FaceMesh(
 )
 
 # ============================================
-# ✅ IMPROVED FACE CROP
+# ✅ v3 IMPROVED FACE CROP (wider forehead)
 # ============================================
 def extract_face_crop(image_bgr):
     """Extract face crop with:
     - SQUARE bounding box (no aspect distortion)
-    - Bigger margin (1.35x)
-    - Extra forehead room (0.55 top vs 0.45 bottom)
+    - Wider margin (1.55x)
+    - Extra forehead room (0.65 top vs 0.35 bottom)
     """
     h, w = image_bgr.shape[:2]
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -80,11 +80,11 @@ def extract_face_crop(image_bgr):
     # Center + square extent
     cx = (x_min_raw + x_max_raw) / 2
     cy = (y_min_raw + y_max_raw) / 2
-    size = max(x_max_raw - x_min_raw, y_max_raw - y_min_raw) * 1.35
+    size = max(x_max_raw - x_min_raw, y_max_raw - y_min_raw) * 1.55   # ← was 1.35
 
-    # Extra forehead (top 55%) vs chin (bottom 45%)
-    y_min = max(0.0, cy - size * 0.55)
-    y_max = min(1.0, cy + size * 0.45)
+    # Extra forehead (top 65%) vs chin (bottom 35%)   ← was 55/45
+    y_min = max(0.0, cy - size * 0.65)
+    y_max = min(1.0, cy + size * 0.35)
     x_min = max(0.0, cx - size * 0.50)
     x_max = min(1.0, cx + size * 0.50)
 
@@ -151,7 +151,7 @@ def process_tar(tar_path, class_name, max_images):
 # MAIN
 # ============================================
 print("=" * 60)
-print("📥 EXTRACTING FER2025 (6k/class, improved crop)")
+print("📥 EXTRACTING FER2025 (6k/class, v3 wider crop)")
 print("=" * 60)
 
 all_X, all_y = [], []
