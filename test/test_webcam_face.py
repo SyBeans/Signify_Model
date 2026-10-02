@@ -1,10 +1,11 @@
 """
 test_webcam_face.py
-Real-time facial emotion recognition — HYBRID pipeline with FSL mapping.
+Real-time facial emotion recognition with 4-class model.
 
-MediaPipe Face Mesh  = DETECTOR (finds face, gives bbox)
-Lean CNN (FER+ 48x48) = CLASSIFIER (predicts raw FER+ emotion)
-FERPLUS_TO_FSL        = MAPPING (translates FER+ → FSL emotions for Signify)
+MediaPipe Face Mesh = DETECTOR
+4-class ResNet     = CLASSIFIER (Positive / Negative / Surprise / Neutral)
+
+The 4 classes are already FSL-relevant — no extra mapping needed.
 """
 
 import cv2
@@ -17,62 +18,44 @@ import os
 # ============================================
 # CONFIGURATION
 # ============================================
-MODEL_PATH = "models/face_hybrid/emotion_cnn.h5"
+MODEL_PATH = "models/face_fer2025_4class/best_4class_seed42.h5"
 
-# Raw FER+ classes (what the CNN was trained on, order matters!)
-FERPLUS_CLASSES = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
+# 4-class model outputs (order matters!)
+CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
 
-# FER+ → FSL mapping (what Signify displays)
-FERPLUS_TO_FSL = {
-    "neutral":   "Neutral",
-    "happy":     "Happy",
-    "sad":       "Sad",
-    "angry":     "Angry",
-    "surprise":  "Questioning",
-    "fear":      "Urgent",
-    "disgust":   "Angry",
+# Icons and colors per class
+CLASS_ICONS = {
+    "Positive": "😊",
+    "Negative": "😢",
+    "Surprise": "😲",
+    "Neutral":  "😐",
 }
-
-# FSL display assets
-FSL_ICONS = {
-    "Neutral":     "😐",
-    "Happy":       "😊",
-    "Sad":         "😢",
-    "Angry":       "😠",
-    "Questioning": "🤔",
-    "Urgent":      "🚨",
+CLASS_COLORS = {
+    "Positive": (0, 255, 0),      # green
+    "Negative": (0, 0, 255),      # red
+    "Surprise": (255, 255, 0),    # cyan
+    "Neutral":  (200, 200, 200),  # gray
 }
-FSL_COLORS = {
-    "Neutral":     (200, 200, 200),
-    "Happy":       (0, 255, 255),
-    "Sad":         (255, 0, 0),
-    "Angry":       (0, 0, 255),
-    "Questioning": (255, 200, 0),
-    "Urgent":      (0, 100, 255),
-}
-FSL_PUNCTUATION = {
-    "Neutral":     ".",
-    "Happy":       "!",
-    "Sad":         ".",
-    "Angry":       "!",
-    "Questioning": "?",
-    "Urgent":      "!",
+CLASS_PUNCTUATION = {
+    "Positive": "!",
+    "Negative": ".",
+    "Surprise": "?",
+    "Neutral":  ".",
 }
 
 IMG_SIZE = 48
-CROP_MARGIN = 0.15
 
 # ============================================
 # LOAD MODEL
 # ============================================
 print("=" * 50)
-print("📥 Loading emotion CNN...")
+print("📥 Loading 4-class emotion model...")
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
-model = tf.keras.models.load_model(MODEL_PATH)
+
+model = tf.keras.models.load_model(MODEL_PATH, compile=False)
 print(f"✅ Model loaded!")
-print(f"   FER+ classes: {FERPLUS_CLASSES}")
-print(f"   FSL classes:  {list(set(FERPLUS_TO_FSL.values()))}")
+print(f"   Classes: {CLASS_NAMES}")
 print("=" * 50)
 
 # ============================================
@@ -101,12 +84,52 @@ print("  3. Press 'Q' to quit")
 print("=" * 50)
 
 # ============================================
-# SMOOTHING (on FSL emotion, after mapping)
+# SMOOTHING
 # ============================================
 prediction_buffer = deque(maxlen=10)
-current_fsl = "Waiting..."
-current_ferplus = None
+current_class = "Waiting..."
 confidence = 0.0
+all_probs = np.zeros(4)
+
+# ============================================
+# FACE CROP (matches training extraction exactly)
+# ============================================
+def extract_face_crop(image_bgr):
+    h, w = image_bgr.shape[:2]
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb)
+    if not results.multi_face_landmarks:
+        return None, None
+
+    lm = results.multi_face_landmarks[0]
+    xs = [p.x for p in lm.landmark]
+    ys = [p.y for p in lm.landmark]
+
+    x_min_raw, x_max_raw = min(xs), max(xs)
+    y_min_raw, y_max_raw = min(ys), max(ys)
+
+    cx = (x_min_raw + x_max_raw) / 2
+    cy = (y_min_raw + y_max_raw) / 2
+    size = max(x_max_raw - x_min_raw, y_max_raw - y_min_raw) * 1.55
+
+    y_min = max(0.0, cy - size * 0.65)
+    y_max = min(1.0, cy + size * 0.35)
+    x_min = max(0.0, cx - size * 0.50)
+    x_max = min(1.0, cx + size * 0.50)
+
+    px1, py1 = int(x_min * w), int(y_min * h)
+    px2, py2 = int(x_max * w), int(y_max * h)
+
+    if px2 <= px1 or py2 <= py1:
+        return None, None
+
+    crop = image_bgr[py1:py2, px1:px2]
+    if crop.size == 0:
+        return None, None
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+    return gray, (px1, py1, px2, py2)
 
 # ============================================
 # MAIN LOOP
@@ -118,105 +141,84 @@ while True:
 
     frame = cv2.flip(frame, 1)
     h, w, _ = frame.shape
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    results = face_mesh.process(frame_rgb)
-    face_detected = False
-    bbox = None
+    crop, bbox = extract_face_crop(frame)
 
-    if results.multi_face_landmarks:
-        face_detected = True
-        face_landmarks = results.multi_face_landmarks[0]
+    if crop is not None:
+        # Predict with flip TTA (matches training eval)
+        x = crop.astype(np.float32) / 255.0
+        x = x.reshape(1, IMG_SIZE, IMG_SIZE, 1)
+        x_flip = x[:, :, ::-1, :]
 
-        # --- bounding box from landmarks ---
-        xs = [lm.x for lm in face_landmarks.landmark]
-        ys = [lm.y for lm in face_landmarks.landmark]
-        x_min, x_max = min(xs), max(xs)
-        y_min, y_max = min(ys), max(ys)
+        p1 = model.predict(x, verbose=0)[0]
+        p2 = model.predict(x_flip, verbose=0)[0]
+        probs = (p1 + p2) / 2.0
 
-        bw = x_max - x_min
-        bh = y_max - y_min
-        x_min = max(0.0, x_min - bw * CROP_MARGIN)
-        x_max = min(1.0, x_max + bw * CROP_MARGIN)
-        y_min = max(0.0, y_min - bh * CROP_MARGIN)
-        y_max = min(1.0, y_max + bh * CROP_MARGIN)
+        pred = int(np.argmax(probs))
+        conf = float(probs[pred]) * 100
+        all_probs = probs
 
-        px1, py1 = int(x_min * w), int(y_min * h)
-        px2, py2 = int(x_max * w), int(y_max * h)
-        bbox = (px1, py1, px2, py2)
+        prediction_buffer.append(CLASS_NAMES[pred])
+        if len(prediction_buffer) > 0:
+            most_common = max(set(prediction_buffer),
+                              key=prediction_buffer.count)
+            current_class = most_common
+            confidence = conf
 
-        # --- draw dots ---
-        for lm in face_landmarks.landmark:
-            cx, cy = int(lm.x * w), int(lm.y * h)
-            if 0 <= cx < w and 0 <= cy < h:
-                frame[cy, cx] = (0, 255, 0)
-
-        # --- crop + preprocess ---
-        crop = frame[py1:py2, px1:px2]
-        if crop.size > 0:
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE))
-            inp = gray.astype(np.float32) / 255.0
-            inp = inp.reshape(1, IMG_SIZE, IMG_SIZE, 1)
-
-            prediction = model.predict(inp, verbose=0)[0]
-            raw_class_idx = int(np.argmax(prediction))
-            conf = float(prediction[raw_class_idx]) * 100
-
-            raw_emotion = FERPLUS_CLASSES[raw_class_idx]
-            fsl_emotion = FERPLUS_TO_FSL[raw_emotion]
-
-            # Smooth on FSL label (not raw), so disgust+angry votes combine
-            prediction_buffer.append(fsl_emotion)
-
-            if len(prediction_buffer) > 0:
-                most_common = max(set(prediction_buffer), key=prediction_buffer.count)
-                current_fsl = most_common
-                current_ferplus = raw_emotion
-                confidence = conf
+        # Draw face bbox
+        px1, py1, px2, py2 = bbox
+        color = CLASS_COLORS.get(current_class, (255, 255, 255))
+        cv2.rectangle(frame, (px1, py1), (px2, py2), color, 2)
     else:
         prediction_buffer.clear()
-        current_fsl = "No face detected"
-        current_ferplus = None
+        current_class = "No face detected"
         confidence = 0.0
+        all_probs = np.zeros(4)
 
     # ============================================
     # DISPLAY
     # ============================================
-    if bbox is not None:
-        px1, py1, px2, py2 = bbox
-        color = FSL_COLORS.get(current_fsl, (255, 255, 255))
-        cv2.rectangle(frame, (px1, py1), (px2, py2), color, 2)
-
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 160), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (w, 200), (0, 0, 0), -1)
     frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
 
-    if face_detected and current_fsl in FSL_ICONS:
-        icon = FSL_ICONS[current_fsl]
-        color = FSL_COLORS[current_fsl]
-        punct = FSL_PUNCTUATION[current_fsl]
+    if current_class in CLASS_ICONS:
+        icon = CLASS_ICONS[current_class]
+        color = CLASS_COLORS[current_class]
+        punct = CLASS_PUNCTUATION[current_class]
 
-        cv2.putText(frame, f"FSL: {current_fsl.upper()} {icon} {punct}",
+        cv2.putText(frame, f"{current_class.upper()} {icon} {punct}",
                     (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 3)
-        cv2.putText(frame, f"FER+ raw: {current_ferplus}",
-                    (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                    (180, 180, 180), 1)
         cv2.putText(frame, f"Confidence: {confidence:.1f}%",
-                    (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                     (255, 255, 255), 2)
 
+        # Confidence bar
         bar_w = int((confidence / 100) * (w - 30))
-        cv2.rectangle(frame, (15, 125), (15 + bar_w, 140), color, -1)
-        cv2.rectangle(frame, (15, 125), (w - 15, 140), (255, 255, 255), 2)
+        cv2.rectangle(frame, (15, 95), (15 + bar_w, 110), color, -1)
+        cv2.rectangle(frame, (15, 95), (w - 15, 110), (255, 255, 255), 2)
+
+        # All 4 class probabilities
+        cv2.putText(frame, "All classes:",
+                    (15, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (180, 180, 180), 1)
+        for i, cname in enumerate(CLASS_NAMES):
+            c_color = CLASS_COLORS[cname]
+            bar_len = int(all_probs[i] * 200)
+            cv2.rectangle(frame, (15, 145 + i*13),
+                          (15 + bar_len, 155 + i*13), c_color, -1)
+            cv2.putText(frame, f"{cname}: {all_probs[i]*100:.0f}%",
+                        (230, 155 + i*13), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (255, 255, 255), 1)
     else:
-        cv2.putText(frame, "No face detected",
+        cv2.putText(frame, current_class,
                     (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
 
     cv2.putText(frame, "Press 'Q' to quit",
-                (15, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                (15, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (200, 200, 200), 1)
 
-    cv2.imshow('Signify - Emotion Test (FSL mapped)', frame)
+    cv2.imshow('Signify - Emotion Test (4-class)', frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break

@@ -1,9 +1,6 @@
 """
-train_emotion_resnet.py  (v2 — Mixup + stronger aug + ensemble-ready)
-
-Fixes overfitting from v1 (train 76% / val 61%).
-Adds: Mixup, zoom aug, light erasing, higher dropout, higher label smoothing.
-Saves test probs for later ensemble averaging.
+train_emotion_4class_v5.py
+4-class training on v5 data (generous crop + CLAHE).
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -14,6 +11,7 @@ os.environ['TF_NUM_INTEROP_THREADS'] = '8'
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.utils import class_weight
 import seaborn as sns
 import tensorflow as tf
 from tensorflow import keras
@@ -24,63 +22,64 @@ tf.config.threading.set_inter_op_parallelism_threads(8)
 tf.config.threading.set_intra_op_parallelism_threads(8)
 
 # ============================================
-# CONFIG
+# CONFIG — v5
 # ============================================
-DATA_PATH   = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025")
-MODELS_PATH = "models/face_fer2025"
+DATA_PATH   = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025_v5")
+MODELS_PATH = "models/face_fer2025_4class_v5"
 IMG_SIZE    = 48
 BATCH_SIZE  = 96
-EPOCHS      = 45
+EPOCHS      = 50
 BASE_LR     = 2e-3
 SEED        = int(os.environ.get("SEED", 42))
 
-EMOTION_CLASSES = ["Angry", "Disgust", "Fear", "Happy", "Neutral", "Sad", "Surprise"]
-NUM_CLASSES = 7
+CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
+NUM_CLASSES = 4
+
+GROUP_MAP = np.array([1, 1, 1, 0, 3, 1, 2], dtype=np.int32)
 
 os.makedirs(MODELS_PATH, exist_ok=True)
 np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
 
 # ============================================
-# LOAD
+# LOAD + REMAP
 # ============================================
-print("=" * 60); print(f"📥 LOADING (seed={SEED})"); print("=" * 60)
+print("=" * 60); print(f"📥 LOADING v5 (seed={SEED})"); print("=" * 60)
 
 X_train = np.load(f"{DATA_PATH}/X_train.npy").astype(np.float32)
-y_train = np.load(f"{DATA_PATH}/y_train.npy")
+y_train_orig = np.load(f"{DATA_PATH}/y_train.npy")
 X_val   = np.load(f"{DATA_PATH}/X_val.npy").astype(np.float32)
-y_val   = np.load(f"{DATA_PATH}/y_val.npy")
+y_val_orig   = np.load(f"{DATA_PATH}/y_val.npy")
 X_test  = np.load(f"{DATA_PATH}/X_test.npy").astype(np.float32)
-y_test  = np.load(f"{DATA_PATH}/y_test.npy")
+y_test_orig  = np.load(f"{DATA_PATH}/y_test.npy")
+
+y_train = GROUP_MAP[y_train_orig]
+y_val   = GROUP_MAP[y_val_orig]
+y_test  = GROUP_MAP[y_test_orig]
 
 print(f"Train: {X_train.shape}  Val: {X_val.shape}  Test: {X_test.shape}")
-print(f"Train per-class: {np.bincount(y_train)}")
+print(f"Train per-class (4): {np.bincount(y_train, minlength=4)}")
 
 y_train_cat = keras.utils.to_categorical(y_train, NUM_CLASSES).astype(np.float32)
 y_val_cat   = keras.utils.to_categorical(y_val,   NUM_CLASSES).astype(np.float32)
 y_test_cat  = keras.utils.to_categorical(y_test,  NUM_CLASSES).astype(np.float32)
 
 # ============================================
-# AUGMENTATION (stronger, still CPU-friendly)
+# CLASS WEIGHTS
+# ============================================
+print("\n" + "=" * 60); print("⚖️  CLASS WEIGHTS"); print("=" * 60)
+cw = class_weight.compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+class_weight_dict = {i: float(w) for i, w in enumerate(cw)}
+for i, name in enumerate(CLASS_NAMES):
+    print(f"  {name:10s} → {class_weight_dict[i]:.4f}")
+
+# ============================================
+# AUGMENTATION
 # ============================================
 def augment(image, label):
     image = tf.image.random_flip_left_right(image)
-    image = tf.image.random_brightness(image, max_delta=0.12)
-    image = tf.image.random_contrast(image, 0.85, 1.15)
-
-    # Zoom
-    image = tf.image.resize_with_crop_or_pad(image, IMG_SIZE + 6, IMG_SIZE + 6)
+    image = tf.image.random_brightness(image, max_delta=0.10)
+    image = tf.image.resize_with_crop_or_pad(image, IMG_SIZE + 4, IMG_SIZE + 4)
     image = tf.image.random_crop(image, size=[IMG_SIZE, IMG_SIZE, 1])
-
-    # Light erasing (10%)
-    if tf.random.uniform([]) < 0.10:
-        eh = tf.random.uniform([], 4, 7, dtype=tf.int32)
-        ew = tf.random.uniform([], 4, 7, dtype=tf.int32)
-        ey = tf.random.uniform([], 0, IMG_SIZE - eh, dtype=tf.int32)
-        ex = tf.random.uniform([], 0, IMG_SIZE - ew, dtype=tf.int32)
-        mask = tf.pad(tf.ones([eh, ew, 1]),
-                      [[ey, IMG_SIZE-eh-ey], [ex, IMG_SIZE-ew-ex], [0, 0]])
-        image = image * (1.0 - mask)
-
     return tf.clip_by_value(image, 0.0, 1.0), label
 
 AUTOTUNE = tf.data.AUTOTUNE
@@ -100,7 +99,7 @@ test_ds  = build_ds(X_test,  y_test_cat,  BATCH_SIZE, False, False)
 # ============================================
 # MIXUP
 # ============================================
-def mixup_batch(images, labels, alpha=0.2):
+def mixup_batch(images, labels, alpha=0.1):
     batch_size = tf.shape(images)[0]
     lam = tf.random.uniform([], 0.0, 1.0, dtype=tf.float32)
     lam = tf.maximum(lam, 1.0 - lam)
@@ -111,11 +110,11 @@ def mixup_batch(images, labels, alpha=0.2):
     mixed_labels = lam * labels + (1.0 - lam) * tf.gather(labels, idx)
     return mixed_images, mixed_labels
 
-train_ds = train_ds.map(lambda x, y: mixup_batch(x, y, 0.2),
+train_ds = train_ds.map(lambda x, y: mixup_batch(x, y, 0.1),
                         num_parallel_calls=AUTOTUNE)
 
 # ============================================
-# SE BLOCK + RESIDUAL BLOCK
+# BLOCKS
 # ============================================
 def se_block(x, ratio=8):
     ch = x.shape[-1]
@@ -147,9 +146,9 @@ def residual_block(x, filters, stride=1, drop=0.0):
     return x
 
 # ============================================
-# BUILD MODEL
+# BUILD
 # ============================================
-print("\n" + "=" * 60); print("🏗️  BUILDING MINI-RESNET (v2)"); print("=" * 60)
+print("\n" + "=" * 60); print("🏗️  BUILDING MINI-RESNET (4-class, v5)"); print("=" * 60)
 
 inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 1))
 
@@ -157,26 +156,26 @@ x = layers.Conv2D(32, 3, padding='same', use_bias=False)(inputs)
 x = layers.BatchNormalization()(x)
 x = layers.Activation('relu')(x)
 
-x = residual_block(x, 32, drop=0.15)
-x = residual_block(x, 64, stride=2, drop=0.20)
-x = residual_block(x, 128, stride=2, drop=0.25)
-x = residual_block(x, 256, stride=2, drop=0.30)
+x = residual_block(x, 32, drop=0.10)
+x = residual_block(x, 64, stride=2, drop=0.15)
+x = residual_block(x, 128, stride=2, drop=0.20)
+x = residual_block(x, 256, stride=2, drop=0.25)
 
 x = layers.GlobalAveragePooling2D()(x)
 x = layers.Dense(128, use_bias=False)(x)
 x = layers.BatchNormalization()(x)
 x = layers.Activation('relu')(x)
-x = layers.Dropout(0.6)(x)
+x = layers.Dropout(0.5)(x)
 outputs = layers.Dense(NUM_CLASSES, activation='softmax')(x)
 
-model = models.Model(inputs, outputs, name=f"emotion_resnet_v2_seed{SEED}")
+model = models.Model(inputs, outputs, name=f"emotion_4class_v5_seed{SEED}")
 
 # ============================================
-# COSINE LR WITH WARMUP + get_config
+# LR
 # ============================================
 steps_per_epoch = len(train_ds)
 total_steps  = EPOCHS * steps_per_epoch
-warmup_steps = 2 * steps_per_epoch
+warmup_steps = 1 * steps_per_epoch
 
 class WarmupCosine(keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, base_lr, warmup, total, min_lr=1e-5):
@@ -203,7 +202,7 @@ lr_schedule = WarmupCosine(BASE_LR, warmup_steps, total_steps)
 
 model.compile(
     optimizer=keras.optimizers.AdamW(learning_rate=lr_schedule, weight_decay=1e-4),
-    loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.15),
+    loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
     metrics=['accuracy']
 )
 model.summary()
@@ -211,7 +210,7 @@ model.summary()
 # ============================================
 # CALLBACKS
 # ============================================
-ckpt_path = os.path.join(MODELS_PATH, f"best_resnet_v2_seed{SEED}.h5")
+ckpt_path = os.path.join(MODELS_PATH, f"best_4class_v5_seed{SEED}.h5")
 callbacks_list = [
     callbacks.ModelCheckpoint(ckpt_path, monitor='val_accuracy',
                               save_best_only=True, verbose=1),
@@ -222,15 +221,17 @@ callbacks_list = [
 # ============================================
 # TRAIN
 # ============================================
-print("\n" + "=" * 60); print(f"🚀 TRAINING v2 (seed={SEED})"); print("=" * 60)
+print("\n" + "=" * 60); print(f"🚀 TRAINING 4-class v5 (seed={SEED})"); print("=" * 60)
 
 history = model.fit(
     train_ds, validation_data=val_ds,
-    epochs=EPOCHS, callbacks=callbacks_list, verbose=1
+    epochs=EPOCHS, callbacks=callbacks_list,
+    class_weight=class_weight_dict,
+    verbose=1
 )
 
 # ============================================
-# EVALUATE WITH FLIP TTA
+# EVALUATE
 # ============================================
 print("\n" + "=" * 60); print("📊 EVALUATING (with flip TTA)"); print("=" * 60)
 
@@ -245,20 +246,27 @@ acc = (y_pred == y_test).mean()
 print(f"\n✅ Test Accuracy (TTA): {acc*100:.2f}%")
 
 print("\n📋 Classification Report:")
-print(classification_report(y_test, y_pred, target_names=EMOTION_CLASSES, digits=4))
+print(classification_report(y_test, y_pred, target_names=CLASS_NAMES, digits=4))
+
+print("\n📊 Per-Class Recognition Rate:")
+for i, name in enumerate(CLASS_NAMES):
+    mask = y_test == i
+    class_acc = (y_pred[mask] == i).mean()
+    verdict = "✅" if class_acc >= 0.80 else ("⚠️" if class_acc >= 0.65 else "❌")
+    print(f"  {verdict} {name:<10} → {class_acc*100:.2f}%")
 
 cm = confusion_matrix(y_test, y_pred)
-plt.figure(figsize=(10, 8))
+plt.figure(figsize=(8, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-            xticklabels=EMOTION_CLASSES, yticklabels=EMOTION_CLASSES)
-plt.title(f'Confusion Matrix v2 (seed={SEED}, TTA acc={acc*100:.2f}%)')
+            xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+plt.title(f'4-Class v5 Confusion Matrix (TTA acc={acc*100:.2f}%)')
 plt.tight_layout()
-plt.savefig(os.path.join(MODELS_PATH, f'cm_v2_seed{SEED}.png'), dpi=150)
+plt.savefig(os.path.join(MODELS_PATH, f'cm_4class_v5_seed{SEED}.png'), dpi=150)
 
-model.save(os.path.join(MODELS_PATH, f'emotion_resnet_v2_seed{SEED}.h5'))
-np.save(os.path.join(MODELS_PATH, f'test_probs_v2_seed{SEED}.npy'), y_prob)
-np.save(os.path.join(MODELS_PATH, f'val_probs_v2_seed{SEED}.npy'),
+model.save(os.path.join(MODELS_PATH, f'emotion_4class_v5_seed{SEED}.h5'))
+np.save(os.path.join(MODELS_PATH, f'test_probs_v5_seed{SEED}.npy'), y_prob)
+np.save(os.path.join(MODELS_PATH, f'val_probs_v5_seed{SEED}.npy'),
         predict_with_tta(model, X_val))
 
-print(f"\n✅ Saved seed {SEED} → {MODELS_PATH}/emotion_resnet_v2_seed{SEED}.h5")
+print(f"\n✅ Saved: {MODELS_PATH}/emotion_4class_v5_seed{SEED}.h5")
 print(f"✅ Test acc: {acc*100:.2f}%")
