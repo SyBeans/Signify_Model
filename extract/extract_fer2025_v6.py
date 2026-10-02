@@ -1,8 +1,7 @@
 """
-extract_fer2025_v5.py
-- MediaPipe as detector + generous crop (1.8x margin)
-- CLAHE contrast enhancement
-- Same 6k/class, same splits
+extract_fer2025_v6.py
+- v3 crop (1.55x tight, proven stable)
+- CLAHE clipLimit=1.5 (reduced from 2.0)
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -16,7 +15,7 @@ import random
 import tarfile
 
 FER2025_PATH = os.path.expanduser("~/Signify/Signify_Model/datasets/FER2025")
-OUTPUT_PATH  = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025_v5")
+OUTPUT_PATH  = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025_v6")
 
 IMG_SIZE = 48
 IMAGES_PER_CLASS = 6000
@@ -36,10 +35,10 @@ face_mesh = mp_face_mesh.FaceMesh(
     refine_landmarks=False, min_detection_confidence=0.3
 )
 
-clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+# ✅ v6: CLAHE 1.5 (gentler)
+clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
 
 def extract_face_crop(image_bgr):
-    """MediaPipe crop (1.8x generous) + CLAHE."""
     h, w = image_bgr.shape[:2]
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(rgb)
@@ -56,12 +55,11 @@ def extract_face_crop(image_bgr):
 
     cx = (x_min_raw + x_max_raw) / 2
     cy = (y_min_raw + y_max_raw) / 2
-    # ✅ v5: generous 1.8x margin
-    size = max(x_max_raw - x_min_raw, y_max_raw - y_min_raw) * 1.8
+    # ✅ v6: back to v3 crop (1.55x tight)
+    size = max(x_max_raw - x_min_raw, y_max_raw - y_min_raw) * 1.55
 
-    # ✅ v5: extended forehead (60%) + chin (40%)
-    y_min = max(0.0, cy - size * 0.60)
-    y_max = min(1.0, cy + size * 0.40)
+    y_min = max(0.0, cy - size * 0.65)
+    y_max = min(1.0, cy + size * 0.35)
     x_min = max(0.0, cx - size * 0.50)
     x_max = min(1.0, cx + size * 0.50)
 
@@ -76,12 +74,12 @@ def extract_face_crop(image_bgr):
         return None
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = clahe.apply(gray)   # ✅ CLAHE from v4
+    gray = clahe.apply(gray)
     gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
     return gray
 
 def process_tar(tar_path, class_name, max_images):
-    print(f"\n📦 {class_name}: {tar_path}")
+    print(f"\n📦 {class_name}")
     X_list, y_list = [], []
     skipped = 0
     label = CLASS_TO_ID[class_name]
@@ -114,7 +112,7 @@ def process_tar(tar_path, class_name, max_images):
     return X_list, y_list
 
 print("=" * 60)
-print("📥 EXTRACTING FER2025 v5 (generous crop + CLAHE)")
+print("📥 EXTRACTING FER2025 v6 (1.55x crop + CLAHE 1.5)")
 print("=" * 60)
 
 all_X, all_y = [], []
