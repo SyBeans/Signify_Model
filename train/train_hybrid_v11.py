@@ -1,10 +1,10 @@
 """
 train_hybrid_v11.py
-Two-branch model:
+Two-branch model on FER-ONLY data:
   - Branch 1: ResNet CNN on 48x48 pixel crops
   - Branch 2: MLP on 936 landmark coords
   - Fusion: concatenate + dense
-Expected: ~82% test, ~75% webcam
+Expected: ~80% test, ~70-75% webcam
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -31,9 +31,9 @@ DATA_PATH   = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025_v11"
 MODELS_PATH = "models/face_fer2025_hybrid_v11"
 IMG_SIZE    = 48
 NUM_LANDMARKS = 936
-BATCH_SIZE  = 192
+BATCH_SIZE  = 256      # ✅ was 192
 EPOCHS      = 50
-BASE_LR     = 1e-3
+BASE_LR     = 5e-4     # ✅ was 1e-3
 SEED        = int(os.environ.get("SEED", 42))
 
 CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
@@ -77,7 +77,7 @@ y_test_cat  = keras.utils.to_categorical(y_test,  NUM_CLASSES).astype(np.float32
 class_weight_dict = {0: 1.0, 1: 0.4, 2: 1.0, 3: 1.0}
 
 # ============================================
-# AUGMENTATION (image + landmark separately)
+# AUGMENTATION
 # ============================================
 def augment_pair(image, landmarks, label):
     # Image aug
@@ -87,9 +87,9 @@ def augment_pair(image, landmarks, label):
     image = tf.image.random_crop(image, size=[IMG_SIZE, IMG_SIZE, 1])
     image = tf.clip_by_value(image, 0.0, 1.0)
 
-    # Landmark aug (NO flip — breaks indices)
+    # Landmark aug (NO flip)
     coords = tf.reshape(landmarks, [468, 2])
-    noise = tf.random.normal(tf.shape(coords), mean=0.0, stddev=0.005)
+    noise = tf.random.normal(tf.shape(coords), mean=0.0, stddev=0.003)  # ✅ was 0.005
     coords = coords + noise
     if tf.random.uniform([]) < 0.5:
         angle = tf.random.uniform([], -0.10, 0.10)
@@ -110,7 +110,11 @@ def build_ds(X, L, y, bs, augment_data=False, shuffle=False):
     if shuffle:
         ds = ds.shuffle(min(len(X), 8000), seed=SEED)
     if augment_data:
-        ds = ds.map(augment_pair, num_parallel_calls=2)
+        # ✅ FIX: lambda unpacks nested tuple
+        ds = ds.map(
+            lambda inputs, label: augment_pair(inputs[0], inputs[1], label),
+            num_parallel_calls=2,
+        )
     return ds.batch(bs).prefetch(2)
 
 train_ds = build_ds(X_train, L_train, y_train_cat, BATCH_SIZE, True, True)
@@ -118,7 +122,7 @@ val_ds   = build_ds(X_val,   L_val,   y_val_cat,   BATCH_SIZE, False, False)
 test_ds  = build_ds(X_test,  L_test,  y_test_cat,  BATCH_SIZE, False, False)
 
 # ============================================
-# IMAGE BRANCH (ResNet-style)
+# IMAGE BRANCH
 # ============================================
 def se_block(x, ratio=8):
     ch = x.shape[-1]
@@ -152,9 +156,9 @@ def residual_block(x, filters, stride=1, drop=0.0):
 # ============================================
 # BUILD HYBRID MODEL
 # ============================================
-print("\n" + "=" * 60); print("🏗️  BUILDING HYBRID MODEL"); print("=" * 60)
+print("\n" + "=" * 60); print("🏗️  BUILDING HYBRID MODEL v11"); print("=" * 60)
 
-# --- Image branch ---
+# Image branch
 img_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 1), name="image")
 xi = layers.Conv2D(32, 3, padding='same', use_bias=False)(img_input)
 xi = layers.BatchNormalization()(xi)
@@ -169,7 +173,7 @@ xi = layers.BatchNormalization()(xi)
 xi = layers.Activation('relu')(xi)
 xi = layers.Dropout(0.4)(xi)
 
-# --- Landmark branch ---
+# Landmark branch
 lm_input = layers.Input(shape=(NUM_LANDMARKS,), name="landmarks")
 xl = layers.Dense(512, kernel_regularizer=regularizers.l2(1e-4))(lm_input)
 xl = layers.BatchNormalization()(xl)
@@ -184,7 +188,7 @@ xl = layers.BatchNormalization()(xl)
 xl = layers.Activation('relu')(xl)
 xl = layers.Dropout(0.25)(xl)
 
-# --- Fusion ---
+# Fusion
 combined = layers.Concatenate()([xi, xl])
 combined = layers.Dense(128, use_bias=False)(combined)
 combined = layers.BatchNormalization()(combined)
@@ -200,7 +204,7 @@ model = models.Model(inputs=[img_input, lm_input], outputs=outputs,
 # ============================================
 steps_per_epoch = len(train_ds)
 total_steps = EPOCHS * steps_per_epoch
-warmup_steps = 2 * steps_per_epoch
+warmup_steps = 3 * steps_per_epoch   # ✅ was 2
 
 class WarmupCosine(keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, base_lr, warmup, total, min_lr=1e-5):
@@ -259,7 +263,6 @@ history = model.fit(
 # ============================================
 print("\n" + "=" * 60); print("📊 EVALUATING (with flip TTA)"); print("=" * 60)
 
-# Note: flip TTA on image only, landmarks unchanged
 def predict_hybrid_tta(model, X, L, batch=128):
     p1 = model.predict([X, L], batch_size=batch, verbose=0)
     X_flip = X[:, :, ::-1, :]
