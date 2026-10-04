@@ -1,8 +1,9 @@
 """
-test_webcam_face.py
+test_webcam_face_v8.py
+- Uses v8 model
+- AGGRESSIVE Surprise suppression (was over-detecting)
+- Surprise must beat second-best by 15% margin to win
 - Face mesh landmarks visible
-- NO probability boost (was breaking Positive/Surprise)
-- Shorter smoothing for faster response
 """
 import cv2
 import numpy as np
@@ -11,7 +12,10 @@ import tensorflow as tf
 from collections import deque
 import os
 
-MODEL_PATH = "models/face_fer2025_4class_v6/best_v6_seed42.h5"
+# ============================================
+# CONFIG
+# ============================================
+MODEL_PATH = "models/face_fer2025_4class_v8/best_v8_seed42.h5"
 
 CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
 
@@ -30,20 +34,29 @@ CLASS_PUNCTUATION = {
 }
 
 IMG_SIZE = 48
-SMOOTHING_LEN = 5
+SMOOTHING_LEN = 8   # ↑ from 5
+
+# ✅ AGGRESSIVE: Surprise penalty (0.80 → 0.40)
+CLASS_WEIGHTS = np.array([1.0, 1.2, 0.40, 1.1], dtype=np.float32)
+
+# ✅ Confidence threshold
+CONFIDENCE_THRESHOLD = 0.42
+
+# ✅ Surprise must beat second-best by this margin
+SURPRISE_MARGIN = 0.15   # 15%
 
 # ============================================
 # LOAD MODEL
 # ============================================
 print("=" * 50)
-print("📥 Loading 4-class emotion model...")
-print(f"   Path: {MODEL_PATH}")
+print("📥 Loading v8 model...")
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
 
 model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-print(f"✅ Model loaded!")
-print(f"   Classes: {CLASS_NAMES}")
+print(f"✅ Model loaded: {CLASS_NAMES}")
+print(f"   Class weights: {CLASS_WEIGHTS}")
+print(f"   Surprise margin: {SURPRISE_MARGIN*100:.0f}%")
 print("=" * 50)
 
 # ============================================
@@ -61,21 +74,18 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_tracking_confidence=0.5
 )
 
-# ============================================
-# WEBCAM
-# ============================================
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-print("\n🎥 Webcam started!")
-print("  Press 'Q' to quit")
+print("\n🎥 Webcam started. Press 'Q' to quit")
 print("=" * 50)
 
 prediction_buffer = deque(maxlen=SMOOTHING_LEN)
 current_class = "Waiting..."
 confidence = 0.0
 all_probs = np.zeros(4)
+raw_probs = np.zeros(4)   # ✅ for debug display
 
 # ============================================
 # FACE CROP
@@ -129,19 +139,16 @@ while True:
 
     results = face_mesh.process(rgb)
 
-    # Draw face mesh landmarks
     if results.multi_face_landmarks:
         for face_landmarks in results.multi_face_landmarks:
             mp_drawing.draw_landmarks(
-                image=frame,
-                landmark_list=face_landmarks,
+                image=frame, landmark_list=face_landmarks,
                 connections=mp_face_mesh.FACEMESH_TESSELATION,
                 landmark_drawing_spec=None,
                 connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style()
             )
             mp_drawing.draw_landmarks(
-                image=frame,
-                landmark_list=face_landmarks,
+                image=frame, landmark_list=face_landmarks,
                 connections=mp_face_mesh.FACEMESH_CONTOURS,
                 landmark_drawing_spec=None,
                 connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
@@ -157,21 +164,40 @@ while True:
         p1 = model.predict(x, verbose=0)[0]
         p2 = model.predict(x_flip, verbose=0)[0]
         probs = (p1 + p2) / 2.0
+        raw_probs = probs.copy()   # ✅ save raw for debug
 
-        # ✅ NO BOOST — use raw probabilities
-        pred = int(np.argmax(probs))
-        conf = float(probs[pred]) * 100
-        all_probs = probs
+        # ✅ LAYER 1: Apply class weights
+        probs = probs * CLASS_WEIGHTS
+        probs = probs / probs.sum()
 
-        prediction_buffer.append(CLASS_NAMES[pred])
-        if len(prediction_buffer) > 0:
-            # Weighted vote (recent frames matter more)
+        # ✅ LAYER 2: Surprise must beat second-best by margin
+        if np.argmax(probs) == 2:   # Surprise is top
+            sorted_idx = np.argsort(probs)
+            second = sorted_idx[-2]
+            if probs[2] < probs[second] + SURPRISE_MARGIN:
+                probs[2] = 0
+                probs = probs / probs.sum()
+
+        top_prob = float(probs.max())
+
+        if top_prob >= CONFIDENCE_THRESHOLD:
+            pred = int(np.argmax(probs))
+            conf = top_prob * 100
+            all_probs = probs
+
+            prediction_buffer.append(CLASS_NAMES[pred])
+
             weighted = {}
             for i, name in enumerate(prediction_buffer):
                 weight = (i + 1) / len(prediction_buffer)
                 weighted[name] = weighted.get(name, 0) + weight
             current_class = max(weighted, key=weighted.get)
             confidence = conf
+        else:
+            all_probs = probs
+            if current_class not in CLASS_ICONS:
+                current_class = "Uncertain"
+                confidence = top_prob * 100
 
         px1, py1, px2, py2 = bbox
         color = CLASS_COLORS.get(current_class, (255, 255, 255))
@@ -181,10 +207,11 @@ while True:
         current_class = "No face detected"
         confidence = 0.0
         all_probs = np.zeros(4)
+        raw_probs = np.zeros(4)
 
     # Display
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 200), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (w, 220), (0, 0, 0), -1)
     frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
 
     if current_class in CLASS_ICONS:
@@ -198,21 +225,31 @@ while True:
                     (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                     (255, 255, 255), 2)
 
-        bar_w = int((confidence / 100) * (w - 30))
-        cv2.rectangle(frame, (15, 95), (15 + bar_w, 110), color, -1)
-        cv2.rectangle(frame, (15, 95), (w - 15, 110), (255, 255, 255), 2)
-
-        cv2.putText(frame, "All classes:",
-                    (15, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+        # Weighted probs (used for prediction)
+        cv2.putText(frame, "Weighted (used):",
+                    (15, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (180, 180, 180), 1)
         for i, cname in enumerate(CLASS_NAMES):
             c_color = CLASS_COLORS[cname]
-            bar_len = int(all_probs[i] * 200)
-            cv2.rectangle(frame, (15, 145 + i*13),
-                          (15 + bar_len, 155 + i*13), c_color, -1)
+            bar_len = int(all_probs[i] * 180)
+            cv2.rectangle(frame, (15, 122 + i*13),
+                          (15 + bar_len, 132 + i*13), c_color, -1)
             cv2.putText(frame, f"{cname}: {all_probs[i]*100:.0f}%",
-                        (230, 155 + i*13), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (200, 132 + i*13), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                         (255, 255, 255), 1)
+
+        # Raw probs (before weighting — for debug)
+        cv2.putText(frame, "Raw model output:",
+                    (15, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (150, 150, 150), 1)
+        for i, cname in enumerate(CLASS_NAMES):
+            c_color = tuple(int(c*0.7) for c in CLASS_COLORS[cname])
+            bar_len = int(raw_probs[i] * 180)
+            cv2.rectangle(frame, (15, 187 + i*13),
+                          (15 + bar_len, 197 + i*13), c_color, -1)
+            cv2.putText(frame, f"{cname}: {raw_probs[i]*100:.0f}%",
+                        (200, 197 + i*13), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                        (180, 180, 180), 1)
     else:
         cv2.putText(frame, current_class,
                     (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
@@ -221,7 +258,7 @@ while True:
                 (15, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (200, 200, 200), 1)
 
-    cv2.imshow('Signify - Emotion Test (4-class v6)', frame)
+    cv2.imshow('Signify - Emotion Test (v8 Aggressive)', frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
