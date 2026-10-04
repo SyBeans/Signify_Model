@@ -1,15 +1,10 @@
 """
-train_hybrid_v12.py
-Hybrid model trained on COMBINED data:
-  - FER2025 (controlled/studio)  — 77k (extracted as fer2025_v11)
-  - RAF-DB   (real-world)        — 15k (extracted as rafdb_v12)
-
-Two-branch model:
-  - Branch 1: ResNet CNN on pixels (48x48)
-  - Branch 2: MLP on landmarks (936)
-  - Fusion: concatenate + dense
-
-Expected: ~83% test, ~78-80% webcam
+train_hybrid_v12.py  (FIXED — stable hybrid)
+Stability fixes:
+  - Batch 256 (was 192) — more stable BatchNorm
+  - LR 5e-4 (was 1e-3) — slower, smoother
+  - Warmup 3 epochs (was 2) — gentler start
+  - Landmark noise 0.003 (was 0.005) — less input variance
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -38,9 +33,9 @@ MODELS_PATH = "models/face_fer2025_hybrid_v12"
 
 IMG_SIZE      = 48
 NUM_LANDMARKS = 936
-BATCH_SIZE    = 192
+BATCH_SIZE    = 256      # ✅ was 192
 EPOCHS        = 50
-BASE_LR       = 1e-3
+BASE_LR       = 5e-4     # ✅ was 1e-3
 SEED          = int(os.environ.get("SEED", 42))
 
 CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
@@ -54,7 +49,6 @@ np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
 # ============================================
 print("=" * 60); print("📥 LOADING FER v11 + RAF v12 (combined)"); print("=" * 60)
 
-# FER: extracted 7-class → remap to 4-class
 GROUP_MAP = np.array([1, 1, 1, 0, 3, 1, 2], dtype=np.int32)
 
 X_fer_train = np.load(f"{FER_PATH}/X_train.npy").astype(np.float32)
@@ -71,7 +65,6 @@ y_fer_test = GROUP_MAP[np.load(f"{FER_PATH}/y_test.npy")]
 
 print(f"FER: train={X_fer_train.shape}, val={X_fer_val.shape}, test={X_fer_test.shape}")
 
-# RAF: already 4-class
 X_raf_train = np.load(f"{RAF_PATH}/X_train.npy").astype(np.float32)
 L_raf_train = np.load(f"{RAF_PATH}/L_train.npy").astype(np.float32)
 y_raf_train = np.load(f"{RAF_PATH}/y_train.npy")
@@ -86,7 +79,7 @@ y_raf_test = np.load(f"{RAF_PATH}/y_test.npy")
 
 print(f"RAF: train={X_raf_train.shape}, val={X_raf_val.shape}, test={X_raf_test.shape}")
 
-# ✅ COMBINE
+# COMBINE
 X_train = np.concatenate([X_fer_train, X_raf_train], axis=0)
 L_train = np.concatenate([L_fer_train, L_raf_train], axis=0)
 y_train = np.concatenate([y_fer_train, y_raf_train], axis=0)
@@ -117,7 +110,6 @@ y_train_cat = keras.utils.to_categorical(y_train, NUM_CLASSES).astype(np.float32
 y_val_cat   = keras.utils.to_categorical(y_val,   NUM_CLASSES).astype(np.float32)
 y_test_cat  = keras.utils.to_categorical(y_test,  NUM_CLASSES).astype(np.float32)
 
-# Class weights (Negative is biggest merged class)
 class_weight_dict = {0: 1.0, 1: 0.4, 2: 1.0, 3: 1.0}
 
 # ============================================
@@ -131,9 +123,9 @@ def augment_pair(image, landmarks, label):
     image = tf.image.random_crop(image, size=[IMG_SIZE, IMG_SIZE, 1])
     image = tf.clip_by_value(image, 0.0, 1.0)
 
-    # Landmark aug (NO flip — breaks landmark indices)
+    # Landmark aug
     coords = tf.reshape(landmarks, [468, 2])
-    noise = tf.random.normal(tf.shape(coords), mean=0.0, stddev=0.005)
+    noise = tf.random.normal(tf.shape(coords), mean=0.0, stddev=0.003)  # ✅ was 0.005
     coords = coords + noise
     if tf.random.uniform([]) < 0.5:
         angle = tf.random.uniform([], -0.10, 0.10)
@@ -154,7 +146,6 @@ def build_ds(X, L, y, bs, augment_data=False, shuffle=False):
     if shuffle:
         ds = ds.shuffle(min(len(X), 10000), seed=SEED)
     if augment_data:
-        # ✅ FIX: lambda unpacks nested tuple before calling augment_pair
         ds = ds.map(
             lambda inputs, label: augment_pair(inputs[0], inputs[1], label),
             num_parallel_calls=2,
@@ -166,7 +157,7 @@ val_ds   = build_ds(X_val,   L_val,   y_val_cat,   BATCH_SIZE, False, False)
 test_ds  = build_ds(X_test,  L_test,  y_test_cat,  BATCH_SIZE, False, False)
 
 # ============================================
-# IMAGE BRANCH (ResNet + SE)
+# IMAGE BRANCH
 # ============================================
 def se_block(x, ratio=8):
     ch = x.shape[-1]
@@ -198,7 +189,7 @@ def residual_block(x, filters, stride=1, drop=0.0):
     return x
 
 # ============================================
-# BUILD HYBRID MODEL
+# BUILD HYBRID
 # ============================================
 print("\n" + "=" * 60); print("🏗️  BUILDING HYBRID v12"); print("=" * 60)
 
@@ -248,7 +239,7 @@ model = models.Model(inputs=[img_input, lm_input], outputs=outputs,
 # ============================================
 steps_per_epoch = len(train_ds)
 total_steps  = EPOCHS * steps_per_epoch
-warmup_steps = 2 * steps_per_epoch
+warmup_steps = 3 * steps_per_epoch   # ✅ was 2
 
 class WarmupCosine(keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, base_lr, warmup, total, min_lr=1e-5):
