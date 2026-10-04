@@ -154,7 +154,11 @@ def build_ds(X, L, y, bs, augment_data=False, shuffle=False):
     if shuffle:
         ds = ds.shuffle(min(len(X), 10000), seed=SEED)
     if augment_data:
-        ds = ds.map(augment_pair, num_parallel_calls=2)
+        # ✅ FIX: lambda unpacks nested tuple before calling augment_pair
+        ds = ds.map(
+            lambda inputs, label: augment_pair(inputs[0], inputs[1], label),
+            num_parallel_calls=2,
+        )
     return ds.batch(bs).prefetch(2)
 
 train_ds = build_ds(X_train, L_train, y_train_cat, BATCH_SIZE, True, True)
