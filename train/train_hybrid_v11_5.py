@@ -7,6 +7,9 @@ Angry/Disgust/Fear/Sad inside the "Negative" group.
 v11.5.1 patch: replaced class_weight dict with WeightedCategoricalFocalLoss
 because Keras 3 (TF 2.16) does not support nested class_weight dicts for
 multi-output models.
+
+v11.5.2 patch: added mode='max' to ModelCheckpoint and EarlyStopping because
+Keras cannot infer monitor direction for custom metric val_cls4_accuracy.
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -299,8 +302,11 @@ model.summary()
 ckpt_path = os.path.join(MODELS_PATH, f"best_hybrid_v11_5_seed{SEED}.h5")
 callbacks_list = [
     callbacks.ModelCheckpoint(ckpt_path, monitor='val_cls4_accuracy',
+                              mode='max',                    # <-- FIX
                               save_best_only=True, verbose=1),
-    callbacks.EarlyStopping(monitor='val_cls4_accuracy', patience=12,
+    callbacks.EarlyStopping(monitor='val_cls4_accuracy',
+                            mode='max',                      # <-- FIX
+                            patience=12,
                             restore_best_weights=True, verbose=1),
 ]
 
