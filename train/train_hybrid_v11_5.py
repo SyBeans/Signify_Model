@@ -3,6 +3,10 @@ train_hybrid_v11_5.py
 v11 + aux 7-class head. Reuses v11 48px landmarks — no re-extraction.
 Only change vs v11: 7-class aux output forces trunk to separate
 Angry/Disgust/Fear/Sad inside the "Negative" group.
+
+v11.5.1 patch: replaced class_weight dict with WeightedCategoricalFocalLoss
+because Keras 3 (TF 2.16) does not support nested class_weight dicts for
+multi-output models.
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -25,12 +29,12 @@ tf.config.threading.set_intra_op_parallelism_threads(8)
 # ============================================
 # CONFIG
 # ============================================
-DATA_PATH   = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025_v11")   # reuse v11
-MODELS_PATH = "models/face_fer2025_hybrid_v11_5"                                    # new dir
+DATA_PATH   = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025_v11")
+MODELS_PATH = "models/face_fer2025_hybrid_v11_5"
 IMG_SIZE    = 48
 NUM_LANDMARKS = 936
-BATCH_SIZE  = 256          # CPU: larger = fewer steps = faster
-EPOCHS      = 50           # early stopping will cut sooner
+BATCH_SIZE  = 256
+EPOCHS      = 50
 BASE_LR     = 5e-4
 SEED        = int(os.environ.get("SEED", 42))
 
@@ -38,7 +42,7 @@ CLASS_NAMES_4 = ["Positive", "Negative", "Surprise", "Neutral"]
 NUM_CLASSES_4 = 4
 NUM_CLASSES_7 = 7
 
-GROUP_MAP = np.array([1, 1, 1, 0, 3, 1, 2], dtype=np.int32)   # 7 -> 4
+GROUP_MAP = np.array([1, 1, 1, 0, 3, 1, 2], dtype=np.int32)
 
 os.makedirs(MODELS_PATH, exist_ok=True)
 np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
@@ -80,7 +84,7 @@ y_test_c4  = keras.utils.to_categorical(y_test4,  NUM_CLASSES_4).astype(np.float
 y_train_c7 = keras.utils.to_categorical(y_train_orig, NUM_CLASSES_7).astype(np.float32)
 y_val_c7   = keras.utils.to_categorical(y_val_orig,   NUM_CLASSES_7).astype(np.float32)
 
-# ---- sqrt inverse-freq class weights (fixes Negative down-weight bug from v11) ----
+# sqrt inverse-freq class weights
 counts4 = np.bincount(y_train4, minlength=NUM_CLASSES_4).astype(np.float32)
 w4 = np.sqrt(counts4.max() / counts4)
 cw4 = {i: float(w4[i]) for i in range(NUM_CLASSES_4)}
@@ -88,7 +92,7 @@ print(f"4-class counts: {counts4}")
 print(f"4-class weights: {cw4}")
 
 # ============================================
-# AUGMENTATION  (consistent flip on image AND landmarks)
+# AUGMENTATION
 # ============================================
 def augment_pair(image, landmarks, label4, label7):
     do_flip = tf.random.uniform([]) < 0.5
@@ -104,7 +108,6 @@ def augment_pair(image, landmarks, label4, label7):
         lambda: coords,
     )
 
-    # Scale jitter (webcam robustness)
     scale = tf.random.uniform([], 0.9, 1.1)
     new_size = tf.cast(tf.round(IMG_SIZE * scale), tf.int32)
     image = tf.image.resize(image, [new_size, new_size])
@@ -115,7 +118,6 @@ def augment_pair(image, landmarks, label4, label7):
     image = tf.image.random_crop(image, size=[IMG_SIZE, IMG_SIZE, 1])
     image = tf.clip_by_value(image, 0.0, 1.0)
 
-    # Landmark noise + small rotation
     noise = tf.random.normal(tf.shape(coords), mean=0.0, stddev=0.003)
     coords = coords + noise
     if tf.random.uniform([]) < 0.5:
@@ -148,7 +150,7 @@ train_ds = build_ds(X_train, L_train, y_train_c4, y_train_c7, BATCH_SIZE, True, 
 val_ds   = build_ds(X_val,   L_val,   y_val_c4,   y_val_c7,   BATCH_SIZE, False, False)
 
 # ============================================
-# MODEL (identical trunk to v11; adds aux head)
+# MODEL
 # ============================================
 def se_block(x, ratio=8):
     ch = x.shape[-1]
@@ -219,6 +221,39 @@ model = models.Model(inputs=[img_input, lm_input],
                      name=f"emotion_hybrid_v11_5_seed{SEED}")
 
 # ============================================
+# WEIGHTED FOCAL LOSS (replaces class_weight= for multi-output)
+# ============================================
+class WeightedCategoricalFocalLoss(keras.losses.Loss):
+    """Focal loss with per-class weights baked in.
+    Needed because Keras 3 (TF 2.16) does not support nested class_weight
+    dicts for multi-output models."""
+    def __init__(self, class_weights, gamma=2.0, alpha=0.25,
+                 label_smoothing=0.05, name='weighted_cat_focal'):
+        super().__init__(name=name)
+        self.class_weights = tf.constant(
+            [float(class_weights[i]) for i in range(len(class_weights))],
+            dtype=tf.float32,
+        )
+        self.gamma = gamma
+        self.alpha = alpha
+        self.label_smoothing = label_smoothing
+        self._base = keras.losses.CategoricalFocalCrossentropy(
+            gamma=gamma, alpha=alpha,
+            label_smoothing=label_smoothing,
+            reduction=None,   # per-sample losses
+        )
+
+    def call(self, y_true, y_pred):
+        per_sample = self._base(y_true, y_pred)          # (batch,)
+        class_idx = tf.argmax(y_true, axis=1)            # (batch,)
+        weights = tf.gather(self.class_weights, class_idx)
+        return tf.reduce_mean(per_sample * weights)
+
+    def get_config(self):
+        return {"gamma": self.gamma, "alpha": self.alpha,
+                "label_smoothing": self.label_smoothing}
+
+# ============================================
 # LR SCHEDULE
 # ============================================
 steps_per_epoch = len(train_ds)
@@ -245,14 +280,14 @@ class WarmupCosine(keras.optimizers.schedules.LearningRateSchedule):
 
 lr_schedule = WarmupCosine(BASE_LR, warmup_steps, total_steps)
 
+loss_cls4 = WeightedCategoricalFocalLoss(
+    cw4, gamma=2.0, alpha=0.25, label_smoothing=0.05)
+loss_cls7 = keras.losses.CategoricalFocalCrossentropy(
+    gamma=2.0, alpha=0.25, label_smoothing=0.05)
+
 model.compile(
     optimizer=keras.optimizers.AdamW(learning_rate=lr_schedule, weight_decay=1e-4),
-    loss={
-        'cls4': keras.losses.CategoricalFocalCrossentropy(
-                    gamma=2.0, alpha=0.25, label_smoothing=0.05),
-        'cls7': keras.losses.CategoricalFocalCrossentropy(
-                    gamma=2.0, alpha=0.25, label_smoothing=0.05),
-    },
+    loss={'cls4': loss_cls4, 'cls7': loss_cls7},
     loss_weights={'cls4': 1.0, 'cls7': 0.4},
     metrics={'cls4': 'accuracy', 'cls7': 'accuracy'},
 )
@@ -269,13 +304,11 @@ callbacks_list = [
                             restore_best_weights=True, verbose=1),
 ]
 
-class_weight_dict = {'cls4': cw4}
-
 print("\n" + "=" * 60); print(f"🚀 TRAINING v11.5 (seed={SEED})"); print("=" * 60)
 history = model.fit(
     train_ds, validation_data=val_ds,
     epochs=EPOCHS, callbacks=callbacks_list,
-    class_weight=class_weight_dict, verbose=1
+    verbose=1
 )
 
 # ============================================
