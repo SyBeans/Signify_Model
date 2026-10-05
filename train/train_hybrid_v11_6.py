@@ -1,0 +1,369 @@
+"""
+train_hybrid_v11_6.py
+v11.5 + face-box landmark normalization + tuned hyperparameters.
+
+Changes vs v11.5:
+  1. Landmarks face-box normalized at load (position/scale invariant)
+  2. BASE_LR: 5e-4 -> 1e-3
+  3. warmup: 3 epochs -> 1 epoch
+  4. focal gamma: 2.0 -> 1.0
+  5. aux head weight: 0.4 -> 0.25
+"""
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['OMP_NUM_THREADS'] = '8'
+os.environ['TF_NUM_INTRAOP_THREADS'] = '8'
+os.environ['TF_NUM_INTEROP_THREADS'] = '8'
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+import tensorflow as tf
+from tensorflow import keras
+from keras import layers, models, callbacks, regularizers
+import random
+
+tf.config.threading.set_inter_op_parallelism_threads(8)
+tf.config.threading.set_intra_op_parallelism_threads(8)
+
+# ============================================
+# CONFIG
+# ============================================
+DATA_PATH   = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025_v11")
+MODELS_PATH = "models/face_fer2025_hybrid_v11_6"
+IMG_SIZE    = 48
+NUM_LANDMARKS = 936
+BATCH_SIZE  = 256
+EPOCHS      = 60
+BASE_LR     = 1e-3                 # was 5e-4
+SEED        = int(os.environ.get("SEED", 42))
+
+CLASS_NAMES_4 = ["Positive", "Negative", "Surprise", "Neutral"]
+NUM_CLASSES_4 = 4
+NUM_CLASSES_7 = 7
+
+GROUP_MAP = np.array([1, 1, 1, 0, 3, 1, 2], dtype=np.int32)
+
+os.makedirs(MODELS_PATH, exist_ok=True)
+np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
+
+# ============================================
+# FACE-BOX NORMALIZATION
+# ============================================
+def face_box_normalize(L):
+    """L: (N, 936) raw normalized coords -> (N, 936) face-box normalized.
+    Centers on face bbox center, scales by max(w,h). Makes landmarks
+    position- and scale-invariant across cameras."""
+    N = L.shape[0]
+    L = L.reshape(N, 468, 2).copy()
+    x = L[:, :, 0]; y = L[:, :, 1]
+    x_min = x.min(axis=1, keepdims=True); x_max = x.max(axis=1, keepdims=True)
+    y_min = y.min(axis=1, keepdims=True); y_max = y.max(axis=1, keepdims=True)
+    cx = (x_min + x_max) * 0.5
+    cy = (y_min + y_max) * 0.5
+    scale = np.maximum(x_max - x_min, y_max - y_min) + 1e-6
+    L[:, :, 0] = (L[:, :, 0] - cx) / scale
+    L[:, :, 1] = (L[:, :, 1] - cy) / scale
+    return L.reshape(N, 936).astype(np.float32)
+
+# ============================================
+# LOAD
+# ============================================
+print("=" * 60); print(f"📥 LOADING hybrid v11.6 (seed={SEED})"); print("=" * 60)
+
+X_train = np.load(f"{DATA_PATH}/X_train.npy").astype(np.float32)
+L_train = face_box_normalize(np.load(f"{DATA_PATH}/L_train.npy"))
+y_train_orig = np.load(f"{DATA_PATH}/y_train.npy")
+
+X_val   = np.load(f"{DATA_PATH}/X_val.npy").astype(np.float32)
+L_val   = face_box_normalize(np.load(f"{DATA_PATH}/L_val.npy"))
+y_val_orig = np.load(f"{DATA_PATH}/y_val.npy")
+
+X_test  = np.load(f"{DATA_PATH}/X_test.npy").astype(np.float32)
+L_test  = face_box_normalize(np.load(f"{DATA_PATH}/L_test.npy"))
+y_test_orig = np.load(f"{DATA_PATH}/y_test.npy")
+
+y_train4 = GROUP_MAP[y_train_orig]
+y_val4   = GROUP_MAP[y_val_orig]
+y_test4  = GROUP_MAP[y_test_orig]
+
+print(f"Train: X={X_train.shape}, L={L_train.shape}")
+print(f"Val:   X={X_val.shape}, L={L_val.shape}")
+print(f"Test:  X={X_test.shape}, L={L_test.shape}")
+print(f"Train per-class (4): {np.bincount(y_train4, minlength=4)}")
+print(f"L_train range: [{L_train.min():.3f}, {L_train.max():.3f}]  (should be ~[-1, 1])")
+
+assert X_train.shape[1] == IMG_SIZE
+
+y_train_c4 = keras.utils.to_categorical(y_train4, NUM_CLASSES_4).astype(np.float32)
+y_val_c4   = keras.utils.to_categorical(y_val4,   NUM_CLASSES_4).astype(np.float32)
+y_test_c4  = keras.utils.to_categorical(y_test4,  NUM_CLASSES_4).astype(np.float32)
+
+y_train_c7 = keras.utils.to_categorical(y_train_orig, NUM_CLASSES_7).astype(np.float32)
+y_val_c7   = keras.utils.to_categorical(y_val_orig,   NUM_CLASSES_7).astype(np.float32)
+
+counts4 = np.bincount(y_train4, minlength=NUM_CLASSES_4).astype(np.float32)
+w4 = np.sqrt(counts4.max() / counts4)
+cw4 = {i: float(w4[i]) for i in range(NUM_CLASSES_4)}
+print(f"4-class counts: {counts4}")
+print(f"4-class weights: {cw4}")
+
+# ============================================
+# AUGMENTATION
+# ============================================
+def augment_pair(image, landmarks, label4, label7):
+    do_flip = tf.random.uniform([]) < 0.5
+
+    image = tf.cond(do_flip,
+                    lambda: tf.image.flip_left_right(image),
+                    lambda: image)
+
+    # Landmarks are already face-box normalized, so flip is just mirror x
+    coords = tf.reshape(landmarks, [468, 2])
+    coords = tf.cond(
+        do_flip,
+        lambda: tf.stack([-coords[:, 0], coords[:, 1]], axis=1),
+        lambda: coords,
+    )
+
+    scale = tf.random.uniform([], 0.9, 1.1)
+    new_size = tf.cast(tf.round(IMG_SIZE * scale), tf.int32)
+    image = tf.image.resize(image, [new_size, new_size])
+    image = tf.image.resize_with_crop_or_pad(image, IMG_SIZE, IMG_SIZE)
+
+    image = tf.image.random_brightness(image, max_delta=0.10)
+    image = tf.image.resize_with_crop_or_pad(image, IMG_SIZE + 4, IMG_SIZE + 4)
+    image = tf.image.random_crop(image, size=[IMG_SIZE, IMG_SIZE, 1])
+    image = tf.clip_by_value(image, 0.0, 1.0)
+
+    # Landmark noise + rotation (rotation still fine on normalized coords)
+    noise = tf.random.normal(tf.shape(coords), mean=0.0, stddev=0.005)
+    coords = coords + noise
+    if tf.random.uniform([]) < 0.5:
+        angle = tf.random.uniform([], -0.15, 0.15)
+        cos_a, sin_a = tf.cos(angle), tf.sin(angle)
+        x_c, y_c = coords[:, 0], coords[:, 1]
+        coords = tf.stack(
+            [cos_a*x_c - sin_a*y_c, sin_a*x_c + cos_a*y_c], axis=1
+        )
+
+    return (image, tf.reshape(coords, [NUM_LANDMARKS])), (label4, label7)
+
+def build_ds(X, L, y4, y7=None, bs=BATCH_SIZE, augment_data=False, shuffle=False):
+    ds = tf.data.Dataset.from_tensor_slices(((X, L), (y4, y7)))
+    if shuffle:
+        ds = ds.shuffle(min(len(X), 8000), seed=SEED)
+    if augment_data:
+        ds = ds.map(
+            lambda inputs, labels: augment_pair(inputs[0], inputs[1],
+                                                labels[0], labels[1]),
+            num_parallel_calls=2,
+        )
+    return ds.batch(bs).prefetch(2)
+
+train_ds = build_ds(X_train, L_train, y_train_c4, y_train_c7, BATCH_SIZE, True, True)
+val_ds   = build_ds(X_val,   L_val,   y_val_c4,   y_val_c7,   BATCH_SIZE, False, False)
+
+# ============================================
+# MODEL
+# ============================================
+def se_block(x, ratio=8):
+    ch = x.shape[-1]
+    s = layers.GlobalAveragePooling2D()(x)
+    s = layers.Dense(ch // ratio, activation='relu')(s)
+    s = layers.Dense(ch, activation='sigmoid')(s)
+    s = layers.Reshape((1, 1, ch))(s)
+    return layers.Multiply()([x, s])
+
+def residual_block(x, filters, stride=1, drop=0.0):
+    shortcut = x
+    if stride != 1 or x.shape[-1] != filters:
+        shortcut = layers.Conv2D(filters, 1, strides=stride,
+                                 padding='same', use_bias=False)(x)
+        shortcut = layers.BatchNormalization()(shortcut)
+    x = layers.Conv2D(filters, 3, strides=stride, padding='same',
+                      use_bias=False,
+                      kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.Conv2D(filters, 3, padding='same', use_bias=False,
+                      kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = se_block(x)
+    x = layers.Add()([x, shortcut])
+    x = layers.Activation('relu')(x)
+    if drop > 0:
+        x = layers.Dropout(drop)(x)
+    return x
+
+print("\n" + "=" * 60); print("🏗️  BUILDING HYBRID v11.6"); print("=" * 60)
+
+img_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 1), name="image")
+xi = layers.Conv2D(32, 3, padding='same', use_bias=False)(img_input)
+xi = layers.BatchNormalization()(xi); xi = layers.Activation('relu')(xi)
+xi = residual_block(xi, 32, drop=0.10)
+xi = residual_block(xi, 64, stride=2, drop=0.15)
+xi = residual_block(xi, 128, stride=2, drop=0.20)
+xi = residual_block(xi, 256, stride=2, drop=0.25)
+xi = layers.GlobalAveragePooling2D()(xi)
+xi = layers.Dense(128, use_bias=False)(xi)
+xi = layers.BatchNormalization()(xi); xi = layers.Activation('relu')(xi)
+xi = layers.Dropout(0.4)(xi)
+
+lm_input = layers.Input(shape=(NUM_LANDMARKS,), name="landmarks")
+xl = layers.Dense(512, kernel_regularizer=regularizers.l2(1e-4))(lm_input)
+xl = layers.BatchNormalization()(xl); xl = layers.Activation('relu')(xl)
+xl = layers.Dropout(0.3)(xl)
+xl = layers.Dense(256, kernel_regularizer=regularizers.l2(1e-4))(xl)
+xl = layers.BatchNormalization()(xl); xl = layers.Activation('relu')(xl)
+xl = layers.Dropout(0.3)(xl)
+xl = layers.Dense(128)(xl)
+xl = layers.BatchNormalization()(xl); xl = layers.Activation('relu')(xl)
+xl = layers.Dropout(0.25)(xl)
+
+combined = layers.Concatenate()([xi, xl])
+combined = layers.Dense(128, use_bias=False)(combined)
+combined = layers.BatchNormalization()(combined)
+combined = layers.Activation('relu')(combined)
+combined = layers.Dropout(0.4)(combined)
+
+out4 = layers.Dense(NUM_CLASSES_4, activation='softmax', name='cls4')(combined)
+aux = layers.Dense(64, activation='relu')(combined)
+out7 = layers.Dense(NUM_CLASSES_7, activation='softmax', name='cls7')(aux)
+
+model = models.Model(inputs=[img_input, lm_input],
+                     outputs=[out4, out7],
+                     name=f"emotion_hybrid_v11_6_seed{SEED}")
+
+# ============================================
+# WEIGHTED FOCAL LOSS
+# ============================================
+class WeightedCategoricalFocalLoss(keras.losses.Loss):
+    def __init__(self, class_weights, gamma=1.0, alpha=0.25,
+                 label_smoothing=0.05, name='weighted_cat_focal'):
+        super().__init__(name=name)
+        self.class_weights = tf.constant(
+            [float(class_weights[i]) for i in range(len(class_weights))],
+            dtype=tf.float32)
+        self.gamma = gamma; self.alpha = alpha
+        self.label_smoothing = label_smoothing
+        self._base = keras.losses.CategoricalFocalCrossentropy(
+            gamma=gamma, alpha=alpha,
+            label_smoothing=label_smoothing, reduction=None)
+
+    def call(self, y_true, y_pred):
+        per_sample = self._base(y_true, y_pred)
+        class_idx = tf.argmax(y_true, axis=1)
+        weights = tf.gather(self.class_weights, class_idx)
+        return tf.reduce_mean(per_sample * weights)
+
+    def get_config(self):
+        return {"gamma": self.gamma, "alpha": self.alpha,
+                "label_smoothing": self.label_smoothing}
+
+# ============================================
+# LR SCHEDULE — warmup now 1 epoch
+# ============================================
+steps_per_epoch = len(train_ds)
+total_steps  = EPOCHS * steps_per_epoch
+warmup_steps = 1 * steps_per_epoch     # was 3
+
+class WarmupCosine(keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, base_lr, warmup, total, min_lr=1e-5):
+        super().__init__()
+        self.base_lr = float(base_lr); self.warmup = float(warmup)
+        self.total = float(total);     self.min_lr = float(min_lr)
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup = tf.cast(self.warmup, tf.float32)
+        total = tf.cast(self.total, tf.float32)
+        warmup_lr = self.base_lr * (step / warmup)
+        progress = tf.clip_by_value((step - warmup) / (total - warmup), 0.0, 1.0)
+        cosine_lr = self.min_lr + 0.5 * (self.base_lr - self.min_lr) * \
+                    (1 + tf.cos(np.pi * progress))
+        return tf.where(step < warmup, warmup_lr, cosine_lr)
+    def get_config(self):
+        return {"base_lr": self.base_lr, "warmup": self.warmup,
+                "total": self.total, "min_lr": self.min_lr}
+
+lr_schedule = WarmupCosine(BASE_LR, warmup_steps, total_steps)
+
+loss_cls4 = WeightedCategoricalFocalLoss(cw4, gamma=1.0, alpha=0.25,
+                                          label_smoothing=0.05)
+loss_cls7 = keras.losses.CategoricalFocalCrossentropy(
+    gamma=1.0, alpha=0.25, label_smoothing=0.05)
+
+model.compile(
+    optimizer=keras.optimizers.AdamW(learning_rate=lr_schedule, weight_decay=1e-4),
+    loss={'cls4': loss_cls4, 'cls7': loss_cls7},
+    loss_weights={'cls4': 1.0, 'cls7': 0.25},   # was 0.4
+    metrics={'cls4': 'accuracy', 'cls7': 'accuracy'},
+)
+model.summary()
+
+# ============================================
+# TRAIN
+# ============================================
+ckpt_path = os.path.join(MODELS_PATH, f"best_hybrid_v11_6_seed{SEED}.h5")
+callbacks_list = [
+    callbacks.ModelCheckpoint(ckpt_path, monitor='val_cls4_accuracy',
+                              mode='max', save_best_only=True, verbose=1),
+    callbacks.EarlyStopping(monitor='val_cls4_accuracy', mode='max',
+                            patience=15, restore_best_weights=True, verbose=1),
+]
+
+print("\n" + "=" * 60); print(f"🚀 TRAINING v11.6 (seed={SEED})"); print("=" * 60)
+history = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS,
+                    callbacks=callbacks_list, verbose=1)
+
+# ============================================
+# EVALUATE
+# ============================================
+print("\n" + "=" * 60); print("📊 EVALUATING v11.6 (flip TTA)"); print("=" * 60)
+
+def predict_tta_4class(model, X, L, batch=128):
+    p1_full = model.predict([X, L], batch_size=batch, verbose=0)
+    p1 = p1_full[0] if isinstance(p1_full, list) else p1_full
+
+    X_flip = X[:, :, ::-1, :]
+    Lr = L.reshape(-1, 468, 2).copy()
+    Lr[:, :, 0] = -Lr[:, :, 0]           # face-box norm: mirror = negate x
+    L_flip = Lr.reshape(-1, NUM_LANDMARKS)
+
+    p2_full = model.predict([X_flip, L_flip], batch_size=batch, verbose=0)
+    p2 = p2_full[0] if isinstance(p2_full, list) else p2_full
+    return (p1 + p2) / 2.0
+
+y_prob = predict_tta_4class(model, X_test, L_test)
+y_pred = np.argmax(y_prob, axis=1)
+acc = (y_pred == y_test4).mean()
+print(f"\n✅ Test Accuracy (TTA): {acc*100:.2f}%")
+print("\n📋 Classification Report:")
+print(classification_report(y_test4, y_pred, target_names=CLASS_NAMES_4, digits=4))
+
+print("\n📊 Per-Class Recognition Rate:")
+for i, name in enumerate(CLASS_NAMES_4):
+    mask = y_test4 == i
+    class_acc = (y_pred[mask] == i).mean()
+    verdict = "✅" if class_acc >= 0.80 else ("⚠️" if class_acc >= 0.65 else "❌")
+    print(f"  {verdict} {name:<10} → {class_acc*100:.2f}%")
+
+cm = confusion_matrix(y_test4, y_pred)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=CLASS_NAMES_4, yticklabels=CLASS_NAMES_4)
+plt.title(f'Hybrid v11.6 (TTA acc={acc*100:.2f}%)')
+plt.tight_layout()
+plt.savefig(os.path.join(MODELS_PATH, f'cm_hybrid_v11_6_seed{SEED}.png'), dpi=150)
+
+print("\n🧹 Stripping 7-class aux head...")
+inference_model = models.Model(
+    inputs=model.input,
+    outputs=model.get_layer('cls4').output,
+    name=f"emotion_hybrid_v11_6_infer_seed{SEED}")
+inference_model.save(os.path.join(MODELS_PATH, f'emotion_hybrid_v11_6_seed{SEED}.h5'))
+np.save(os.path.join(MODELS_PATH, f'test_probs_v11_6_seed{SEED}.npy'), y_prob)
+
+print(f"\n✅ Saved: {MODELS_PATH}/emotion_hybrid_v11_6_seed{SEED}.h5")
+print(f"✅ Test acc: {acc*100:.2f}%")
