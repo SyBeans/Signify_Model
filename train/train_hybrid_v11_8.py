@@ -30,7 +30,7 @@ MODELS_PATH = "models/face_fer2025_hybrid_v11_8"
 IMG_SIZE    = 48
 NUM_LANDMARKS = 936
 BATCH_SIZE  = 256
-EPOCHS      = 70
+EPOCHS      = 80
 BASE_LR     = 5e-4
 SEED        = int(os.environ.get("SEED", 42))
 
