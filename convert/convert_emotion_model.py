@@ -1,16 +1,18 @@
 """
 convert_emotion_model.py
-Convert emotion_hybrid_v11_8_seed42.h5 (dual input) to TFLite via SavedModel.
+Convert emotion model via frozen graph (fixes Keras 3 + BN Cast bug).
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 import numpy as np
 import tensorflow as tf
+from tensorflow.python.framework.convert_to_constants import (
+    convert_variables_to_constants_v2,
+)
 
 BASE = os.path.expanduser("~/Signify/Signify_Model")
 H5_PATH  = f"{BASE}/models/face_fer2025_hybrid_v11_8/emotion_hybrid_v11_8_seed42.h5"
-SAVEDMODEL_PATH = f"{BASE}/convert/output/emotion_model_saved"
 TFLITE_PATH = f"{BASE}/convert/output/emotion_model.tflite"
 DATA_PATH = f"{BASE}/landmarks/fer2025_v11"
 
@@ -18,7 +20,7 @@ IMG_SIZE = 48
 NUM_LANDMARKS = 936
 
 print("=" * 60)
-print("😊 EMOTION MODEL CONVERSION (via SavedModel)")
+print("😊 EMOTION MODEL CONVERSION (frozen graph)")
 print("=" * 60)
 
 # ---- load ----
@@ -27,36 +29,28 @@ model = tf.keras.models.load_model(H5_PATH, compile=False)
 print(f"✅ Inputs:  {[i.shape for i in model.inputs]}")
 print(f"✅ Outputs: {[o.shape for o in model.outputs]}")
 
-# ---- save as SavedModel with explicit signature ----
-print(f"\nSaving as SavedModel → {SAVEDMODEL_PATH}")
+# ---- build concrete function with FIXED batch=1 ----
+print("\nBuilding concrete function (batch=1)...")
 
-@tf.function(input_signature=[
-    tf.TensorSpec(shape=[None, IMG_SIZE, IMG_SIZE, 1], dtype=tf.float32, name='image'),
-    tf.TensorSpec(shape=[None, NUM_LANDMARKS], dtype=tf.float32, name='landmarks'),
-])
+@tf.function
 def serve(img, lm):
-    return {'output': model([img, lm])}
+    return model([img, lm], training=False)
 
-concrete = serve.get_concrete_function()
-
-# Save the graph via the concrete function
-tf.saved_model.save(
-    model,
-    SAVEDMODEL_PATH,
-    signatures={'serving_default': concrete},
+concrete = serve.get_concrete_function(
+    tf.TensorSpec([1, IMG_SIZE, IMG_SIZE, 1], tf.float32, name='image'),
+    tf.TensorSpec([1, NUM_LANDMARKS], tf.float32, name='landmarks'),
 )
-print("✅ SavedModel ready")
 
-# ---- convert ----
-print("\nConverting SavedModel → TFLite...")
-converter = tf.lite.TFLiteConverter.from_saved_model(SAVEDMODEL_PATH)
+# ---- freeze: variables → constants (this is the key fix) ----
+print("Freezing variables to constants...")
+frozen = convert_variables_to_constants_v2(concrete)
 
+# ---- convert from frozen graph ----
+print("Converting frozen graph → TFLite...")
+converter = tf.lite.TFLiteConverter.from_concrete_functions([frozen])
 converter.target_spec.supported_ops = [
     tf.lite.OpsSet.TFLITE_BUILTINS,
-    tf.lite.OpsSet.SELECT_TF_OPS,   # fallback for any tricky ops
 ]
-converter._experimental_lower_tensor_list_ops = False
-
 tflite_model = converter.convert()
 
 with open(TFLITE_PATH, 'wb') as f:
@@ -95,7 +89,6 @@ for d in in_details:
     print(f"  name={d['name']} shape={d['shape']} dtype={d['dtype']}")
 print(f"TFLite output: shape={out_detail['shape']}")
 
-# Locate inputs by name; fallback to order
 img_idx = None
 lm_idx = None
 for d in in_details:
@@ -104,10 +97,8 @@ for d in in_details:
         img_idx = d['index']
     elif 'landmark' in nm:
         lm_idx = d['index']
-
 if img_idx is None or lm_idx is None:
-    img_idx = in_details[0]['index']
-    lm_idx  = in_details[1]['index']
+    img_idx, lm_idx = in_details[0]['index'], in_details[1]['index']
 
 tflite_labels = []
 tflite_probs_all = []
