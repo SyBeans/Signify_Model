@@ -42,8 +42,8 @@ NUM_LANDMARKS = 936
 EMOTION_SMOOTHING_LEN = 8
 EMOTION_CONF_THRESHOLD = 0.40
 EMOTION_CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
-# FIXED: Boost Negative (2.0), suppress Neutral (0.8)
-EMOTION_WEIGHTS = np.array([1.0, 2.0, 1.0, 0.8], dtype=np.float32)
+# Reverted to original weights
+EMOTION_WEIGHTS = np.array([1.0, 0.50, 1.0, 1.50], dtype=np.float32)
 EMOTION_COLORS = {
     "Positive": (0, 255, 0), "Negative": (0, 0, 255),
     "Surprise": (255, 255, 0), "Neutral": (200, 200, 200),

@@ -25,8 +25,8 @@ SMOOTHING_LEN = 8
 CONFIDENCE_THRESHOLD = 0.40
 
 # FIXED: Re-balanced weights to fix the "Angry" bug
-# Pos: 1.0, Neg: 2.0 (Boosted!), Sur: 1.0, Neu: 0.8 (Suppressed)
-CLASS_WEIGHTS = np.array([1.0, 2.0, 1.0, 0.8], dtype=np.float32)
+
+CLASS_WEIGHTS = np.array([1.0, 0.50, 1.0, 1.50], dtype=np.float32)
 
 print("=" * 50)
 print(f"📥 Loading: {MODEL_PATH}")
