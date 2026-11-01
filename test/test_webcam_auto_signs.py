@@ -1,6 +1,6 @@
 """
 test_webcam_natural.py (CONTINUOUS + TIME-BASED BUFFER)
-Fixes: Emojis removed for OpenCV compatibility, time-based cooldown.
+Fixes: Emojis removed for OpenCV, time-based cooldown, Duplicate Hand Filter.
 """
 
 import cv2
@@ -114,10 +114,10 @@ class SignStreamer:
         velocities[1:] = sampled[1:] - sampled[:-1]
         return np.concatenate([sampled, velocities], axis=1)
 
-    def update(self, hand_landmarks_list):
+    def update(self, valid_hand_landmarks):
         self._trim_old()
 
-        if not hand_landmarks_list:
+        if not valid_hand_landmarks:
             self.no_hand_frames += 1
             if self.no_hand_frames >= HAND_DROP_DELAY:
                 self.active = False
@@ -130,14 +130,16 @@ class SignStreamer:
         self.no_hand_frames = 0
 
         hand1 = []
-        for lm in hand_landmarks_list[0].landmark:
+        for lm in valid_hand_landmarks[0].landmark:
             hand1.extend([lm.x, lm.y, lm.z])
-        if len(hand_landmarks_list) >= 2:
+            
+        if len(valid_hand_landmarks) >= 2:
             hand2 = []
-            for lm in hand_landmarks_list[1].landmark:
+            for lm in valid_hand_landmarks[1].landmark:
                 hand2.extend([lm.x, lm.y, lm.z])
         else:
             hand2 = [0.0] * HAND_FEATURES
+            
         positions = hand1 + hand2
 
         motion = 0.0
@@ -209,10 +211,28 @@ while True:
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(frame_rgb)
 
-    hand_detected = bool(results.multi_hand_landmarks)
+    # ── DUPLICATE HAND FILTER ──
+    valid_hands = []
+    if results.multi_hand_landmarks:
+        # Always add the first hand
+        valid_hands.append(results.multi_hand_landmarks[0])
+        
+        # Check for duplicate hallucination on the 2nd hand
+        if len(results.multi_hand_landmarks) >= 2:
+            h1_wrist = results.multi_hand_landmarks[0].landmark[0]
+            h2_wrist = results.multi_hand_landmarks[1].landmark[0]
+            
+            dist = np.linalg.norm(np.array([h1_wrist.x, h1_wrist.y]) - np.array([h2_wrist.x, h2_wrist.y]))
+            
+            # If wrists are far apart, it's a real 2nd hand
+            if dist > 0.12:
+                valid_hands.append(results.multi_hand_landmarks[1])
+
+    hand_detected = bool(valid_hands)
 
     if hand_detected:
-        for hand_landmarks in results.multi_hand_landmarks:
+        # Draw only the valid hands
+        for hand_landmarks in valid_hands:
             mp_draw.draw_landmarks(
                 frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
                 mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
@@ -230,7 +250,8 @@ while True:
         fps_frames = 0
         fps_last_time = now
 
-    sign_data = streamer.update(results.multi_hand_landmarks)
+    # Pass valid_hands to the streamer instead of results.multi_hand_landmarks
+    sign_data = streamer.update(valid_hands)
 
     if sign_data is not None:
         input_data = np.array([sign_data], dtype=np.float32)
@@ -271,7 +292,7 @@ while True:
 
     if hand_detected:
         status_color = (0, 255, 0) if streamer.active else (0, 200, 255)
-        status_text = "SIGNING" if streamer.active else "HAND (still)"
+        status_text = f"SIGNING ({len(valid_hands)})" if streamer.active else f"HAND ({len(valid_hands)} - still)"
     else:
         status_color = (0, 0, 255)
         status_text = "READY - Show hand"

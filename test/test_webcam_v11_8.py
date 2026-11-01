@@ -1,6 +1,6 @@
 """
 test_webcam_v11_8.py
-Webcam test for v11.8. TTA matches training: image flipped, landmarks NOT flipped.
+Webcam test for v11.8. Single pass (matches Flutter app). Fixes Duplicate Faces & Negative bias.
 """
 import cv2
 import numpy as np
@@ -24,10 +24,9 @@ NUM_LANDMARKS = 936
 SMOOTHING_LEN = 8
 CONFIDENCE_THRESHOLD = 0.40
 
-# v11.8 has balanced weights from training.
-# Start neutral here. Bump if a class under-fires live.
-CLASS_WEIGHTS = np.array([1.0, 0.50, 1.0, 1.50], dtype=np.float32)
-#                             Pos   Neg   Sur   Neu
+# FIXED: Re-balanced weights to fix the "Angry" bug
+# Pos: 1.0, Neg: 2.0 (Boosted!), Sur: 1.0, Neu: 0.8 (Suppressed)
+CLASS_WEIGHTS = np.array([1.0, 2.0, 1.0, 0.8], dtype=np.float32)
 
 print("=" * 50)
 print(f"📥 Loading: {MODEL_PATH}")
@@ -60,6 +59,8 @@ all_probs = np.zeros(4)
 def extract_both(image_bgr, results):
     if not results.multi_face_landmarks:
         return None, None, None
+    
+    # FIXED: Only process the first face
     h, w = image_bgr.shape[:2]
     lm = results.multi_face_landmarks[0]
     xs = [p.x for p in lm.landmark]; ys = [p.y for p in lm.landmark]
@@ -83,12 +84,9 @@ def extract_both(image_bgr, results):
     lm_in = coords.flatten().reshape(1, NUM_LANDMARKS)
     return img_in, lm_in, (px1, py1, px2, py2)
 
-def predict_tta(img_in, lm_in):
-    """Image flipped, landmarks NOT flipped — matches v11.8 training."""
-    p1 = model.predict([img_in, lm_in], verbose=0)[0]
-    img_flip = img_in[:, :, ::-1, :]
-    p2 = model.predict([img_flip, lm_in], verbose=0)[0]
-    return (p1 + p2) / 2.0
+def predict_single(img_in, lm_in):
+    """Single pass inference — matches the Flutter app exactly."""
+    return model.predict([img_in, lm_in], verbose=0)[0]
 
 print("🎥 Webcam started. Press 'Q' to quit.")
 
@@ -101,17 +99,21 @@ while True:
     results = face_mesh.process(rgb)
 
     if results.multi_face_landmarks:
-        for fl in results.multi_face_landmarks:
-            mp_drawing.draw_landmarks(
-                image=frame, landmark_list=fl,
-                connections=mp_face_mesh.FACEMESH_TESSELATION,
-                landmark_drawing_spec=None,
-                connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style())
+        # FIXED: Only draw the FIRST face. Ignore background faces.
+        fl = results.multi_face_landmarks[0]
+        mp_drawing.draw_landmarks(
+            image=frame, landmark_list=fl,
+            connections=mp_face_mesh.FACEMESH_TESSELATION,
+            landmark_drawing_spec=None,
+            connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style())
 
     img_in, lm_in, bbox = extract_both(frame, results)
 
     if img_in is not None:
-        probs = predict_tta(img_in, lm_in)
+        # Use single pass (no TTA) to match Flutter
+        probs = predict_single(img_in, lm_in)
+        
+        # Apply the fixed class weights
         probs = probs * CLASS_WEIGHTS
         probs = probs / probs.sum()
         all_probs = probs
@@ -155,7 +157,7 @@ while True:
         cv2.putText(frame, current_class, (15, 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
 
-    cv2.imshow('Signify - v11.8 Emotion (80.12%)', frame)
+    cv2.imshow('Signify - v11.8 Emotion (Fixed)', frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
