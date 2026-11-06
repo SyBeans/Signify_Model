@@ -1,7 +1,7 @@
 """
-test_webcam_combined.py (FPS OPTIMIZED + 5-POINT FACE HUD)
-Runs BOTH Sign and Emotion. Skips MediaPipe processing every other frame.
-Draws a sleek 5-point facial outline instead of a bulky bounding box.
+test_webcam_combined.py (ULTIMATE FPS OPTIMIZATION)
+Runs BOTH Sign and Emotion. Alternates MediaPipe (Hands on even frames, Face on odd).
+Minimalist drawing (dots only) to save OpenCV rendering time.
 """
 
 import cv2
@@ -47,8 +47,7 @@ EMOTION_COLORS = {
 }
 
 # FPS Optimizations
-PROCESS_EVERY_N_FRAMES = 2    
-EMOTION_EVERY_N_FRAMES = 10   
+EMOTION_EVERY_N_FRAMES = 10
 
 # ============================================
 # LOAD MODELS
@@ -69,7 +68,6 @@ print("=" * 60)
 # MEDIAPIPE SETUP
 # ============================================
 mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
 hands = mp_hands.Hands(
     static_image_mode=False, max_num_hands=MAX_HANDS,
     min_detection_confidence=0.5, min_tracking_confidence=0.5
@@ -238,8 +236,9 @@ while True:
     
     frame_count += 1
 
-    # ── 1. PROCESS MEDIAPIPE (SKIP FRAMES FOR SPEED) ──
-    if frame_count % PROCESS_EVERY_N_FRAMES == 0:
+    # ── ALTERNATING MEDIAPIPE INFERENCE ──
+    # Even frames: Process Hands. Odd frames: Process Face.
+    if frame_count % 2 == 0:
         results_hands = hands.process(rgb)
         cached_valid_hands = []
         if results_hands.multi_hand_landmarks:
@@ -250,52 +249,35 @@ while True:
                 dist = np.linalg.norm(np.array([h1_wrist.x, h1_wrist.y]) - np.array([h2_wrist.x, h2_wrist.y]))
                 if dist > 0.12:
                     cached_valid_hands.append(results_hands.multi_hand_landmarks[1])
-
+    else:
         results_face = face_mesh.process(rgb)
         if results_face.multi_face_landmarks:
             cached_first_face = results_face.multi_face_landmarks[0]
         else:
             cached_first_face = None
 
-    # ── DRAWING HANDS ──
+    # ── DRAWING MINIMALIST HANDS (Fingertips + Wrist Only) ──
     if cached_valid_hands:
         for hand_landmarks in cached_valid_hands:
-            mp_draw.draw_landmarks(
-                frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-                mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
-                mp_draw.DrawingSpec(color=(0, 0, 255), thickness=3, circle_radius=4)
-            )
             for idx, lm in enumerate(hand_landmarks.landmark):
-                cx, cy = int(lm.x * w), int(lm.y * h)
-                if idx in [4, 8, 12, 16, 20]:
-                    cv2.circle(frame, (cx, cy), 6, (0, 255, 255), -1)
+                if idx in [0, 4, 8, 12, 16, 20]: # Wrist + 5 fingertips
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(frame, (cx, cy), 6, (0, 255, 0), -1)
+                    cv2.circle(frame, (cx, cy), 2, (255, 255, 255), -1)
 
-    # ── DRAWING 5-POINT FACE HUD ──
+    # ── DRAWING 5-POINT FACE HUD (DOTS ONLY) ──
     if cached_first_face:
         color = EMOTION_COLORS.get(current_emotion, (255, 255, 255))
         landmarks = cached_first_face.landmark
         
         # 10 = Forehead, 234 = Left Cheek, 152 = Chin, 454 = Right Cheek, 1 = Nose
-        face_pts = [10, 234, 152, 454]
-        coords = []
+        face_pts = [10, 234, 152, 454, 1]
+        
         for pt_idx in face_pts:
             pt = landmarks[pt_idx]
-            coords.append((int(pt.x * w), int(pt.y * h)))
-            
-        nose_pt = landmarks[1]
-        nose_coord = (int(nose_pt.x * w), int(nose_pt.y * h))
-        
-        # Draw face outline
-        for i in range(len(coords)):
-            p1 = coords[i]
-            p2 = coords[(i+1) % len(coords)]
-            cv2.line(frame, p1, p2, color, 2)
-            cv2.circle(frame, p1, 3, color, -1)
-            
-        # Draw nose and crosshairs
-        cv2.circle(frame, nose_coord, 4, color, -1)
-        cv2.line(frame, coords[0], nose_coord, color, 1) # Forehead to nose
-        cv2.line(frame, coords[2], nose_coord, color, 1) # Chin to nose
+            cx, cy = int(pt.x * w), int(pt.y * h)
+            cv2.circle(frame, (cx, cy), 4, color, -1)
+            cv2.circle(frame, (cx, cy), 1, (255, 255, 255), -1)
 
     # ── SIGN INFERENCE ──
     sign_data = streamer.update(cached_valid_hands)
@@ -391,7 +373,7 @@ while True:
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
         cv2.putText(frame, f"Sent: {sentence_str}", (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-    cv2.imshow('Signify - Optimized', frame)
+    cv2.imshow('Signify - Ultimate FPS', frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'): break
