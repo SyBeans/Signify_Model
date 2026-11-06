@@ -1,7 +1,7 @@
 """
 test_webcam_combined.py
 Runs BOTH Hand Sign Recognition and Face Emotion Recognition simultaneously.
-Fixes: Clear FPS counter, removed heavy face mesh, added emotion bounding box.
+Fixes: Lower resolution for FPS, FaceMesh complexity=0, aggressive emotion weights.
 """
 
 import cv2
@@ -41,8 +41,10 @@ NUM_LANDMARKS = 936
 EMOTION_SMOOTHING_LEN = 8
 EMOTION_CONF_THRESHOLD = 0.40
 EMOTION_CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
-# Reverted to original weights
-EMOTION_WEIGHTS = np.array([1.0, 0.50, 1.0, 1.50], dtype=np.float32)
+
+# FIXED: Crushed Negative (0.2) and massively boosted Neutral (3.0)
+EMOTION_WEIGHTS = np.array([1.0, 0.2, 1.0, 3.0], dtype=np.float32)
+
 EMOTION_COLORS = {
     "Positive": (0, 255, 0), "Negative": (0, 0, 255),
     "Surprise": (255, 255, 0), "Neutral": (200, 200, 200),
@@ -64,7 +66,7 @@ print(f"Emotion Model Loaded! Classes: {EMOTION_CLASS_NAMES}")
 print("=" * 60)
 
 # ============================================
-# MEDIAPIPE SETUP
+# MEDIAPIPE SETUP (FPS OPTIMIZATION)
 # ============================================
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
@@ -74,11 +76,11 @@ hands = mp_hands.Hands(
 )
 
 mp_face_mesh = mp.solutions.face_mesh
-# Removed mp_drawing_styles since we aren't drawing the tesselation mesh anymore
+# FIXED: Added model_complexity=0 to speed up FaceMesh dramatically
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=False, max_num_faces=1,
     refine_landmarks=False, min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+    min_tracking_confidence=0.5, model_complexity=0 
 )
 
 # ============================================
@@ -167,7 +169,7 @@ class SignStreamer:
         return self._resample_to_model()
 
 # ============================================
-# EMOTION HELPERS (Updated to return bbox)
+# EMOTION HELPERS
 # ============================================
 def extract_face_emotion(image_bgr, face_landmarks):
     h, w = image_bgr.shape[:2]
@@ -192,7 +194,6 @@ def extract_face_emotion(image_bgr, face_landmarks):
     coords = np.array([[p.x, p.y] for p in lm.landmark], dtype=np.float32)
     lm_in = coords.flatten().reshape(1, NUM_LANDMARKS)
     
-    # Return bbox so we can draw it on screen
     return img_in, lm_in, (px1, py1, px2, py2)
 
 # ============================================
@@ -217,11 +218,12 @@ fps_last_time = time.time()
 emotion_frame_counter = 0
 
 # ============================================
-# WEBCAM & MAIN LOOP
+# WEBCAM & MAIN LOOP (FPS OPTIMIZATION)
 # ============================================
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+# FIXED: Lowered resolution to 320x240 to boost FPS
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
 print("\nWebcam ready! Press 'Q' to quit, 'C' to clear.")
 print("=" * 60)
@@ -296,8 +298,9 @@ while True:
     if first_face and emotion_frame_counter % 5 == 0:
         img_in, lm_in, bbox = extract_face_emotion(frame, first_face)
         if img_in is not None:
-            face_bbox = bbox # Save for drawing
+            face_bbox = bbox 
             probs = emotion_model.predict([img_in, lm_in], verbose=0)[0]
+            # Apply the new aggressive weights
             probs = probs * EMOTION_WEIGHTS
             probs = probs / probs.sum()
             emotion_probs = probs
@@ -309,12 +312,12 @@ while True:
                 emotion_buffer.append(EMOTION_CLASS_NAMES[pred_idx])
                 current_emotion = Counter(emotion_buffer).most_common(1)[0][0]
 
-    # ── DRAW FACE BOX (Replaces the heavy mesh) ──
+    # ── DRAW FACE BOX ──
     if face_bbox is not None:
         px1, py1, px2, py2 = face_bbox
         color = EMOTION_COLORS.get(current_emotion, (255, 255, 255))
         cv2.rectangle(frame, (px1, py1), (px2, py2), color, 2)
-        cv2.putText(frame, "Face Crop", (px1, py1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        cv2.putText(frame, "Face", (px1, py1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
     # ── FPS ──
     fps_frames += 1
@@ -325,7 +328,7 @@ while True:
         fps_last_time = now
 
     # ============================================
-    # UI OVERLAY (Reduced from 180 to 130 height)
+    # UI OVERLAY
     # ============================================
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, 130), (0, 0, 0), -1)
@@ -336,36 +339,35 @@ while True:
     status_color = (0, 255, 0) if streamer.active else (0, 200, 255)
     if not valid_hands: status_text, status_color = "NO HAND", (0, 0, 255)
 
-    cv2.putText(frame, f"SIGN: {current_display}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-    cv2.putText(frame, f"Conf: {sign_conf:.1f}%  Status: {status_text}", (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+    cv2.putText(frame, f"SIGN: {current_display}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(frame, f"Conf: {sign_conf:.1f}%  {status_text}", (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
     cv2.putText(frame, f"Buffer: {len(streamer.frames_buffer)}  Votes: {len(vote_buffer)}/{VOTE_WINDOW}", (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     
     if last_commit_info:
-        cv2.putText(frame, f"Last: {last_commit_info}", (15, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 255, 100), 1)
+        cv2.putText(frame, f"Last: {last_commit_info}", (15, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 100), 1)
 
-    # RIGHT SIDE: EMOTION (Moved up slightly to fit FPS below it)
+    # RIGHT SIDE: EMOTION
     if current_emotion in EMOTION_CLASS_NAMES:
         emo_color = EMOTION_COLORS[current_emotion]
-        cv2.putText(frame, f"EMOTION: {current_emotion.upper()}", (w - 250, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, emo_color, 2)
-        cv2.putText(frame, f"Conf: {emotion_conf:.1f}%", (w - 250, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, f"EMOTION: {current_emotion.upper()}", (w - 180, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, emo_color, 2)
+        cv2.putText(frame, f"Conf: {emotion_conf:.1f}%", (w - 180, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        # Draw probability bars
         for i, cname in enumerate(EMOTION_CLASS_NAMES):
-            bar_len = int(emotion_probs[i] * 80)
-            cv2.rectangle(frame, (w - 250, 80 + i*12), (w - 250 + bar_len, 90 + i*12), EMOTION_COLORS[cname], -1)
-            cv2.putText(frame, f"{cname[:3]}: {emotion_probs[i]*100:.0f}%", (w - 160, 90 + i*12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            bar_len = int(emotion_probs[i] * 60) # Shortened bar for smaller screen
+            cv2.rectangle(frame, (w - 180, 75 + i*12), (w - 180 + bar_len, 85 + i*12), EMOTION_COLORS[cname], -1)
+            cv2.putText(frame, f"{cname[:3]}: {emotion_probs[i]*100:.0f}%", (w - 110, 85 + i*12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
     else:
-        cv2.putText(frame, "EMOTION: WAITING", (w - 250, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+        cv2.putText(frame, "EMOTION: WAIT", (w - 180, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 2)
 
-    # ── FPS COUNTER (Moved to Top Center, Large & Green) ──
-    cv2.putText(frame, f"FPS: {fps:.1f}", (w//2 - 50, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    # FPS TOP CENTER
+    cv2.putText(frame, f"FPS: {fps:.1f}", (w//2 - 30, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
     # SENTENCE BOTTOM
     if sentence_words:
         sentence_str = " ".join(sentence_words[-8:])
-        cv2.rectangle(overlay, (0, h - 50), (w, h), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (0, h - 40), (w, h), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
-        cv2.putText(frame, f"Sentence: {sentence_str}", (15, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f"Sent: {sentence_str}", (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
     cv2.imshow('Signify - Combined Sign + Emotion', frame)
 
