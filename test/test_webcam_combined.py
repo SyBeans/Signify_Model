@@ -1,7 +1,7 @@
 """
-test_webcam_combined.py
-Runs BOTH Hand Sign Recognition and Face Emotion Recognition simultaneously.
-Fixes: TypeError on FaceMesh, lower resolution for FPS, aggressive emotion weights.
+test_webcam_combined.py (FPS OPTIMIZED + 5-POINT FACE HUD)
+Runs BOTH Sign and Emotion. Skips MediaPipe processing every other frame.
+Draws a sleek 5-point facial outline instead of a bulky bounding box.
 """
 
 import cv2
@@ -24,7 +24,6 @@ NUM_FRAMES = 30
 HAND_FEATURES = 63
 MAX_HANDS = 2
 SIGN_CONF_THRESHOLD = 50
-
 BUFFER_SECONDS = 4.0
 MIN_FRAMES_TO_PREDICT = 8
 MOTION_START_THRESHOLD = 0.015
@@ -41,14 +40,15 @@ NUM_LANDMARKS = 936
 EMOTION_SMOOTHING_LEN = 8
 EMOTION_CONF_THRESHOLD = 0.40
 EMOTION_CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
-
-# Crushed Negative (0.2) and massively boosted Neutral (3.0)
 EMOTION_WEIGHTS = np.array([1.0, 0.2, 1.0, 3.0], dtype=np.float32)
-
 EMOTION_COLORS = {
     "Positive": (0, 255, 0), "Negative": (0, 0, 255),
     "Surprise": (255, 255, 0), "Neutral": (200, 200, 200),
 }
+
+# FPS Optimizations
+PROCESS_EVERY_N_FRAMES = 2    
+EMOTION_EVERY_N_FRAMES = 10   
 
 # ============================================
 # LOAD MODELS
@@ -76,7 +76,6 @@ hands = mp_hands.Hands(
 )
 
 mp_face_mesh = mp.solutions.face_mesh
-# FIXED: Removed model_complexity argument
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=False, max_num_faces=1,
     refine_landmarks=False, min_detection_confidence=0.5,
@@ -183,9 +182,9 @@ def extract_face_emotion(image_bgr, face_landmarks):
     x0 = max(0.0, cx - size * 0.50); x1 = min(1.0, cx + size * 0.50)
     px1, py1 = int(x0*w), int(y0*h); px2, py2 = int(x1*w), int(y1*h)
     
-    if px2 <= px1 or py2 <= py1: return None, None, None
+    if px2 <= px1 or py2 <= py1: return None, None
     crop = image_bgr[py1:py2, px1:px2]
-    if crop.size == 0: return None, None, None
+    if crop.size == 0: return None, None
     
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
@@ -194,7 +193,7 @@ def extract_face_emotion(image_bgr, face_landmarks):
     coords = np.array([[p.x, p.y] for p in lm.landmark], dtype=np.float32)
     lm_in = coords.flatten().reshape(1, NUM_LANDMARKS)
     
-    return img_in, lm_in, (px1, py1, px2, py2)
+    return img_in, lm_in
 
 # ============================================
 # STATE VARIABLES
@@ -210,18 +209,20 @@ emotion_buffer = deque(maxlen=EMOTION_SMOOTHING_LEN)
 current_emotion = "Waiting..."
 emotion_conf = 0.0
 emotion_probs = np.zeros(4)
-face_bbox = None
 
 fps = 0.0
 fps_frames = 0
 fps_last_time = time.time()
+
+frame_count = 0
+cached_valid_hands = []
+cached_first_face = None
 emotion_frame_counter = 0
 
 # ============================================
-# WEBCAM & MAIN LOOP (FPS OPTIMIZATION)
+# WEBCAM & MAIN LOOP
 # ============================================
 cap = cv2.VideoCapture(0)
-# Lowered resolution to 320x240 to boost FPS
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
@@ -234,28 +235,31 @@ while True:
     frame = cv2.flip(frame, 1)
     h, w = frame.shape[:2]
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+    frame_count += 1
 
-    # ── 1. PROCESS HANDS ──
-    results_hands = hands.process(rgb)
-    valid_hands = []
-    if results_hands.multi_hand_landmarks:
-        valid_hands.append(results_hands.multi_hand_landmarks[0])
-        if len(results_hands.multi_hand_landmarks) >= 2:
-            h1_wrist = results_hands.multi_hand_landmarks[0].landmark[0]
-            h2_wrist = results_hands.multi_hand_landmarks[1].landmark[0]
-            dist = np.linalg.norm(np.array([h1_wrist.x, h1_wrist.y]) - np.array([h2_wrist.x, h2_wrist.y]))
-            if dist > 0.12:
-                valid_hands.append(results_hands.multi_hand_landmarks[1])
+    # ── 1. PROCESS MEDIAPIPE (SKIP FRAMES FOR SPEED) ──
+    if frame_count % PROCESS_EVERY_N_FRAMES == 0:
+        results_hands = hands.process(rgb)
+        cached_valid_hands = []
+        if results_hands.multi_hand_landmarks:
+            cached_valid_hands.append(results_hands.multi_hand_landmarks[0])
+            if len(results_hands.multi_hand_landmarks) >= 2:
+                h1_wrist = results_hands.multi_hand_landmarks[0].landmark[0]
+                h2_wrist = results_hands.multi_hand_landmarks[1].landmark[0]
+                dist = np.linalg.norm(np.array([h1_wrist.x, h1_wrist.y]) - np.array([h2_wrist.x, h2_wrist.y]))
+                if dist > 0.12:
+                    cached_valid_hands.append(results_hands.multi_hand_landmarks[1])
 
-    # ── 2. PROCESS FACE ──
-    results_face = face_mesh.process(rgb)
-    first_face = None
-    if results_face.multi_face_landmarks:
-        first_face = results_face.multi_face_landmarks[0] 
+        results_face = face_mesh.process(rgb)
+        if results_face.multi_face_landmarks:
+            cached_first_face = results_face.multi_face_landmarks[0]
+        else:
+            cached_first_face = None
 
     # ── DRAWING HANDS ──
-    if valid_hands:
-        for hand_landmarks in valid_hands:
+    if cached_valid_hands:
+        for hand_landmarks in cached_valid_hands:
             mp_draw.draw_landmarks(
                 frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
                 mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
@@ -266,8 +270,35 @@ while True:
                 if idx in [4, 8, 12, 16, 20]:
                     cv2.circle(frame, (cx, cy), 6, (0, 255, 255), -1)
 
+    # ── DRAWING 5-POINT FACE HUD ──
+    if cached_first_face:
+        color = EMOTION_COLORS.get(current_emotion, (255, 255, 255))
+        landmarks = cached_first_face.landmark
+        
+        # 10 = Forehead, 234 = Left Cheek, 152 = Chin, 454 = Right Cheek, 1 = Nose
+        face_pts = [10, 234, 152, 454]
+        coords = []
+        for pt_idx in face_pts:
+            pt = landmarks[pt_idx]
+            coords.append((int(pt.x * w), int(pt.y * h)))
+            
+        nose_pt = landmarks[1]
+        nose_coord = (int(nose_pt.x * w), int(nose_pt.y * h))
+        
+        # Draw face outline
+        for i in range(len(coords)):
+            p1 = coords[i]
+            p2 = coords[(i+1) % len(coords)]
+            cv2.line(frame, p1, p2, color, 2)
+            cv2.circle(frame, p1, 3, color, -1)
+            
+        # Draw nose and crosshairs
+        cv2.circle(frame, nose_coord, 4, color, -1)
+        cv2.line(frame, coords[0], nose_coord, color, 1) # Forehead to nose
+        cv2.line(frame, coords[2], nose_coord, color, 1) # Chin to nose
+
     # ── SIGN INFERENCE ──
-    sign_data = streamer.update(valid_hands)
+    sign_data = streamer.update(cached_valid_hands)
     if sign_data is not None:
         input_data = np.array([sign_data], dtype=np.float32)
         prediction = sign_model.predict(input_data, verbose=0)[0]
@@ -293,14 +324,12 @@ while True:
                         last_commit_info = f"{word} ({conf:.0f}%) [{votes}/{VOTE_WINDOW}]"
                         print(f"Committed: {word}")
 
-    # ── EMOTION INFERENCE (Every 5 frames) ──
+    # ── EMOTION INFERENCE ──
     emotion_frame_counter += 1
-    if first_face and emotion_frame_counter % 5 == 0:
-        img_in, lm_in, bbox = extract_face_emotion(frame, first_face)
+    if cached_first_face and emotion_frame_counter % EMOTION_EVERY_N_FRAMES == 0:
+        img_in, lm_in = extract_face_emotion(frame, cached_first_face)
         if img_in is not None:
-            face_bbox = bbox 
             probs = emotion_model.predict([img_in, lm_in], verbose=0)[0]
-            # Apply the new aggressive weights
             probs = probs * EMOTION_WEIGHTS
             probs = probs / probs.sum()
             emotion_probs = probs
@@ -311,13 +340,6 @@ while True:
                 emotion_conf = top_prob * 100
                 emotion_buffer.append(EMOTION_CLASS_NAMES[pred_idx])
                 current_emotion = Counter(emotion_buffer).most_common(1)[0][0]
-
-    # ── DRAW FACE BOX ──
-    if face_bbox is not None:
-        px1, py1, px2, py2 = face_bbox
-        color = EMOTION_COLORS.get(current_emotion, (255, 255, 255))
-        cv2.rectangle(frame, (px1, py1), (px2, py2), color, 2)
-        cv2.putText(frame, "Face", (px1, py1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
     # ── FPS ──
     fps_frames += 1
@@ -337,7 +359,7 @@ while True:
     # LEFT SIDE: SIGN
     status_text = "SIGNING" if streamer.active else "READY"
     status_color = (0, 255, 0) if streamer.active else (0, 200, 255)
-    if not valid_hands: status_text, status_color = "NO HAND", (0, 0, 255)
+    if not cached_valid_hands: status_text, status_color = "NO HAND", (0, 0, 255)
 
     cv2.putText(frame, f"SIGN: {current_display}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     cv2.putText(frame, f"Conf: {sign_conf:.1f}%  {status_text}", (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
@@ -369,7 +391,7 @@ while True:
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
         cv2.putText(frame, f"Sent: {sentence_str}", (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-    cv2.imshow('Signify - Combined Sign + Emotion', frame)
+    cv2.imshow('Signify - Optimized', frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'): break
