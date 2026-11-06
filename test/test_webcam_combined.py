@@ -1,7 +1,7 @@
 """
 test_webcam_combined.py
 Runs BOTH Hand Sign Recognition and Face Emotion Recognition simultaneously.
-Fixes: Lower resolution for FPS, FaceMesh complexity=0, aggressive emotion weights.
+Fixes: TypeError on FaceMesh, lower resolution for FPS, aggressive emotion weights.
 """
 
 import cv2
@@ -42,7 +42,7 @@ EMOTION_SMOOTHING_LEN = 8
 EMOTION_CONF_THRESHOLD = 0.40
 EMOTION_CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
 
-# FIXED: Crushed Negative (0.2) and massively boosted Neutral (3.0)
+# Crushed Negative (0.2) and massively boosted Neutral (3.0)
 EMOTION_WEIGHTS = np.array([1.0, 0.2, 1.0, 3.0], dtype=np.float32)
 
 EMOTION_COLORS = {
@@ -66,7 +66,7 @@ print(f"Emotion Model Loaded! Classes: {EMOTION_CLASS_NAMES}")
 print("=" * 60)
 
 # ============================================
-# MEDIAPIPE SETUP (FPS OPTIMIZATION)
+# MEDIAPIPE SETUP
 # ============================================
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
@@ -76,11 +76,11 @@ hands = mp_hands.Hands(
 )
 
 mp_face_mesh = mp.solutions.face_mesh
-# FIXED: Added model_complexity=0 to speed up FaceMesh dramatically
+# FIXED: Removed model_complexity argument
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=False, max_num_faces=1,
     refine_landmarks=False, min_detection_confidence=0.5,
-    min_tracking_confidence=0.5, model_complexity=0 
+    min_tracking_confidence=0.5
 )
 
 # ============================================
@@ -221,7 +221,7 @@ emotion_frame_counter = 0
 # WEBCAM & MAIN LOOP (FPS OPTIMIZATION)
 # ============================================
 cap = cv2.VideoCapture(0)
-# FIXED: Lowered resolution to 320x240 to boost FPS
+# Lowered resolution to 320x240 to boost FPS
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
@@ -353,7 +353,7 @@ while True:
         cv2.putText(frame, f"Conf: {emotion_conf:.1f}%", (w - 180, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         for i, cname in enumerate(EMOTION_CLASS_NAMES):
-            bar_len = int(emotion_probs[i] * 60) # Shortened bar for smaller screen
+            bar_len = int(emotion_probs[i] * 60)
             cv2.rectangle(frame, (w - 180, 75 + i*12), (w - 180 + bar_len, 85 + i*12), EMOTION_COLORS[cname], -1)
             cv2.putText(frame, f"{cname[:3]}: {emotion_probs[i]*100:.0f}%", (w - 110, 85 + i*12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
     else:
