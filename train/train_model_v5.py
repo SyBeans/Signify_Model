@@ -20,9 +20,9 @@ from keras import layers, models, callbacks
 # CONFIGURATION
 # ============================================
 LANDMARKS_PATH = "landmarks/merged"        # Loads from the new merge script
-MODELS_PATH = "models/hand"
-LABELS_CSV = "datasets/FSL/labels.csv"     # Original 105 FSL labels
-OUTPUT_LABELS_JSON = "models/hand/labels_v5.json"  # New: full 106 labels for app
+MODELS_PATH = "models/hand_v5"        # 🆕 New folder!
+LABELS_CSV = "datasets/FSL/labels.csv"     
+OUTPUT_LABELS_JSON = "models/hand_v5/labels_v5.json"  # 🆕 Saved inside the new folder
 
 BATCH_SIZE = 32
 EPOCHS = 200
