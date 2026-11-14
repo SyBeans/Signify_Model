@@ -19,7 +19,7 @@ from keras import layers, models, callbacks
 # ============================================
 # CONFIGURATION
 # ============================================
-LANDMARKS_PATH = "landmarks/merged"        # ← CHANGED: merged dataset
+LANDMARKS_PATH = "landmarks/merged"        # Loads from the new merge script
 MODELS_PATH = "models/hand"
 LABELS_CSV = "datasets/FSL/labels.csv"     # Original 105 FSL labels
 OUTPUT_LABELS_JSON = "models/hand/labels_v5.json"  # New: full 106 labels for app
@@ -30,7 +30,7 @@ LEARNING_RATE = 0.001
 
 NUM_FRAMES = 30
 NUM_FEATURES = 252
-NUM_CLASSES = 106                          # ← CHANGED: 105 FSL + 1 REST
+NUM_CLASSES = 106                          # 105 FSL + 1 REST
 
 USE_AUGMENTATION = True
 
@@ -112,6 +112,19 @@ if USE_AUGMENTATION:
     y_train = np.array(y_aug, dtype=np.int32)
 
     print(f"✅ Original: {original_count:,} → Augmented: {X_train.shape[0]:,}")
+
+# ============================================
+# SHUFFLE DATA (CRITICAL FOR VALIDATION SPLIT)
+# ============================================
+print("\n" + "=" * 60)
+print("🔀 SHUFFLING DATA")
+print("=" * 60)
+# We must shuffle because the merge script groups data by class.
+# Without this, Keras's validation_split=0.2 would only validate on REST and the last few signs!
+perm = np.random.permutation(len(X_train))
+X_train = X_train[perm]
+y_train = y_train[perm]
+print(f"✅ Shuffled {len(X_train):,} samples")
 
 # ============================================
 # CLASS WEIGHTS
