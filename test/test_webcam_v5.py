@@ -1,0 +1,445 @@
+"""
+test_webcam_v5.py
+Webcam test for the 106-class v5 model (FSL-105 + REST).
+Matches the Flutter app logic exactly:
+- Time-based buffer
+- Motion gate
+- 6-vote window (4/6 needed)
+- 1s cooldown
+- 6-frame hand-drop delay
+- REST IGNORE logic (won't add REST to sentence)
+"""
+
+import cv2
+import numpy as np
+import mediapipe as mp
+import tensorflow as tf
+import json
+import os
+import time
+from collections import Counter, deque
+
+# ============================================
+# CONFIGURATION
+# ============================================
+# 🆕 Updated to use the 106-class v5 model
+SIGN_MODEL_PATH = "models/hand_v5/sign_model_v5.h5"
+LABELS_JSON = "models/hand_v5/labels_v5.json"  # 106 labels (with REST at index 105)
+EMOTION_MODEL_PATH = "models/face_fer2025_hybrid_v11_8/emotion_hybrid_v11_8_seed42.h5"
+
+# Sign Config (same as app)
+NUM_FRAMES = 30
+HAND_FEATURES = 63
+MAX_HANDS = 2
+SIGN_CONF_THRESHOLD = 50
+BUFFER_SECONDS = 4.0
+MIN_FRAMES_TO_PREDICT = 8
+MOTION_START_THRESHOLD = 0.015
+MOTION_HISTORY_LEN = 10
+PREDICT_EVERY_N_FRAMES = 2
+VOTE_WINDOW = 6
+STABLE_VOTE_COUNT = 4
+COOLDOWN_SECONDS = 1.0
+HAND_DROP_DELAY = 6
+
+# 🆕 REST class ID
+REST_CLASS_ID = 105
+REST_CLASS_NAME = "REST"
+
+# Emotion Config
+IMG_SIZE = 48
+NUM_LANDMARKS = 936
+EMOTION_SMOOTHING_LEN = 8
+EMOTION_CONF_THRESHOLD = 0.40
+EMOTION_CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
+# 🆕 v11.8 was balanced at training — no post-softmax weights needed
+EMOTION_WEIGHTS = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+EMOTION_COLORS = {
+    "Positive": (0, 255, 0), "Negative": (0, 0, 255),
+    "Surprise": (255, 255, 0), "Neutral": (200, 200, 200),
+}
+
+# FPS Optimizations (same as app)
+EMOTION_EVERY_N_FRAMES = 10
+
+# ============================================
+# LOAD MODELS
+# ============================================
+print("=" * 60)
+print("Loading Sign Model (v5, 106 classes)...")
+if not os.path.exists(SIGN_MODEL_PATH):
+    raise FileNotFoundError(f"❌ Not found: {SIGN_MODEL_PATH}\n   Did you finish training train_model_v5.py?")
+
+sign_model = tf.keras.models.load_model(SIGN_MODEL_PATH)
+
+# 🆕 Load 106 labels from labels_v5.json (not CSV)
+with open(LABELS_JSON) as f:
+    label_names = json.load(f)
+
+print(f"✅ Sign Model Loaded! Classes: {len(label_names)}")
+print(f"   First 5: {label_names[:5]}")
+print(f"   Last 5:  {label_names[-5:]}")
+
+# Sanity check REST class is present
+if len(label_names) != 106:
+    print(f"⚠️  WARNING: Expected 106 labels, got {len(label_names)}")
+if label_names[REST_CLASS_ID] != REST_CLASS_NAME:
+    print(f"⚠️  WARNING: Label[{REST_CLASS_ID}] should be '{REST_CLASS_NAME}', got '{label_names[REST_CLASS_ID]}'")
+
+print("\nLoading Emotion Model (v11.8)...")
+emotion_model = tf.keras.models.load_model(EMOTION_MODEL_PATH, compile=False)
+print(f"✅ Emotion Model Loaded! Classes: {EMOTION_CLASS_NAMES}")
+print("=" * 60)
+
+# ============================================
+# MEDIAPIPE SETUP
+# ============================================
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False, max_num_hands=MAX_HANDS,
+    min_detection_confidence=0.5, min_tracking_confidence=0.5
+)
+
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False, max_num_faces=1,
+    refine_landmarks=False, min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# ============================================
+# TIME-BASED SIGN STREAMER (identical to app)
+# ============================================
+class SignStreamer:
+    def __init__(self):
+        self.frames_buffer = deque()
+        self.last_positions = None
+        self.motion_history = deque(maxlen=MOTION_HISTORY_LEN)
+        self.no_hand_frames = 0
+        self.predict_counter = 0
+        self.active = False
+        self.last_motion = 0.0
+        self.cooldown_until = 0.0
+
+    def reset(self):
+        self.frames_buffer.clear()
+        self.last_positions = None
+        self.motion_history.clear()
+        self.no_hand_frames = 0
+        self.predict_counter = 0
+        self.active = False
+        self.cooldown_until = 0.0
+
+    def _trim_old(self):
+        now = time.time()
+        while self.frames_buffer and (now - self.frames_buffer[0][0]) > BUFFER_SECONDS:
+            self.frames_buffer.popleft()
+
+    def _resample_to_model(self):
+        if len(self.frames_buffer) < MIN_FRAMES_TO_PREDICT:
+            return None
+        ts_arr = np.array([ts for ts, _ in self.frames_buffer], dtype=np.float64)
+        pos_arr = np.array([pos for _, pos in self.frames_buffer], dtype=np.float32)
+        t_min, t_max = ts_arr[0], ts_arr[-1]
+        if t_max <= t_min:
+            return None
+        target_ts = np.linspace(t_min, t_max, NUM_FRAMES)
+        indices = np.searchsorted(ts_arr, target_ts)
+        indices = np.clip(indices, 0, len(ts_arr) - 1)
+        sampled = pos_arr[indices]
+        velocities = np.zeros_like(sampled)
+        velocities[1:] = sampled[1:] - sampled[:-1]
+        return np.concatenate([sampled, velocities], axis=1)
+
+    def update(self, valid_hand_landmarks):
+        self._trim_old()
+        if not valid_hand_landmarks:
+            self.no_hand_frames += 1
+            if self.no_hand_frames >= HAND_DROP_DELAY:
+                self.active = False
+                self.frames_buffer.clear()
+                self.motion_history.clear()
+                self.last_positions = None
+                self.predict_counter = 0
+            return None
+
+        self.no_hand_frames = 0
+        hand1 = [c for lm in valid_hand_landmarks[0].landmark for c in (lm.x, lm.y, lm.z)]
+        hand2 = [c for lm in valid_hand_landmarks[1].landmark for c in (lm.x, lm.y, lm.z)] if len(valid_hand_landmarks) >= 2 else [0.0] * HAND_FEATURES
+        positions = hand1 + hand2
+
+        motion = 0.0
+        if self.last_positions is not None:
+            motion = float(np.linalg.norm(np.array(positions) - np.array(self.last_positions)))
+        self.last_positions = positions
+        self.last_motion = motion
+        self.motion_history.append(motion)
+
+        if not any(m > MOTION_START_THRESHOLD for m in self.motion_history):
+            self.active = False
+            self.frames_buffer.clear()
+            return None
+
+        self.active = True
+        self.frames_buffer.append((time.time(), positions))
+
+        if time.time() < self.cooldown_until:
+            return None
+
+        self.predict_counter += 1
+        if self.predict_counter % PREDICT_EVERY_N_FRAMES != 0:
+            return None
+
+        return self._resample_to_model()
+
+# ============================================
+# EMOTION HELPERS
+# ============================================
+def extract_face_emotion(image_bgr, face_landmarks):
+    h, w = image_bgr.shape[:2]
+    lm = face_landmarks
+    xs = [p.x for p in lm.landmark]; ys = [p.y for p in lm.landmark]
+    x_min, x_max = min(xs), max(xs); y_min, y_max = min(ys), max(ys)
+    cx, cy = (x_min+x_max)/2, (y_min+y_max)/2
+    size = max(x_max-x_min, y_max-y_min) * 1.55
+
+    y0 = max(0.0, cy - size * 0.65); y1 = min(1.0, cy + size * 0.35)
+    x0 = max(0.0, cx - size * 0.50); x1 = min(1.0, cx + size * 0.50)
+    px1, py1 = int(x0*w), int(y0*h); px2, py2 = int(x1*w), int(y1*h)
+    
+    if px2 <= px1 or py2 <= py1: return None, None
+    crop = image_bgr[py1:py2, px1:px2]
+    if crop.size == 0: return None, None
+    
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+    img_in = (gray.astype(np.float32) / 255.0).reshape(1, IMG_SIZE, IMG_SIZE, 1)
+
+    coords = np.array([[p.x, p.y] for p in lm.landmark], dtype=np.float32)
+    lm_in = coords.flatten().reshape(1, NUM_LANDMARKS)
+    
+    return img_in, lm_in
+
+# ============================================
+# STATE VARIABLES
+# ============================================
+streamer = SignStreamer()
+vote_buffer = []
+sentence_words = []
+current_display = "Ready..."
+sign_conf = 0.0
+last_commit_info = ""
+rest_blocked_count = 0  # 🆕 Count how many REST predictions were correctly blocked
+
+emotion_buffer = deque(maxlen=EMOTION_SMOOTHING_LEN)
+current_emotion = "Waiting..."
+emotion_conf = 0.0
+emotion_probs = np.zeros(4)
+
+fps = 0.0
+fps_frames = 0
+fps_last_time = time.time()
+
+frame_count = 0
+cached_valid_hands = []
+cached_first_face = None
+emotion_frame_counter = 0
+
+# 🆕 Live REST indicator (for UI)
+rest_confidence = 0.0
+top_sign_confidence = 0.0
+
+# ============================================
+# WEBCAM & MAIN LOOP
+# ============================================
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+print("\n🎥 Webcam ready! Press 'Q' to quit, 'C' to clear.")
+print(f"   Model: {len(label_names)} classes (FSL-105 + REST)")
+print(f"   REST will be IGNORED (won't add to sentence)")
+print("=" * 60)
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+    frame = cv2.flip(frame, 1)
+    h, w = frame.shape[:2]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+    frame_count += 1
+
+    # ── ALTERNATING MEDIAPIPE INFERENCE ──
+    if frame_count % 2 == 0:
+        results_hands = hands.process(rgb)
+        cached_valid_hands = []
+        if results_hands.multi_hand_landmarks:
+            cached_valid_hands.append(results_hands.multi_hand_landmarks[0])
+            if len(results_hands.multi_hand_landmarks) >= 2:
+                h1_wrist = results_hands.multi_hand_landmarks[0].landmark[0]
+                h2_wrist = results_hands.multi_hand_landmarks[1].landmark[0]
+                dist = np.linalg.norm(np.array([h1_wrist.x, h1_wrist.y]) - np.array([h2_wrist.x, h2_wrist.y]))
+                if dist > 0.12:
+                    cached_valid_hands.append(results_hands.multi_hand_landmarks[1])
+    else:
+        results_face = face_mesh.process(rgb)
+        if results_face.multi_face_landmarks:
+            cached_first_face = results_face.multi_face_landmarks[0]
+        else:
+            cached_first_face = None
+
+    # ── DRAWING MINIMALIST HANDS ──
+    if cached_valid_hands:
+        for hand_landmarks in cached_valid_hands:
+            for idx, lm in enumerate(hand_landmarks.landmark):
+                if idx in [0, 4, 8, 12, 16, 20]:
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(frame, (cx, cy), 6, (0, 255, 0), -1)
+                    cv2.circle(frame, (cx, cy), 2, (255, 255, 255), -1)
+
+    # ── DRAWING 5-POINT FACE HUD ──
+    if cached_first_face:
+        color = EMOTION_COLORS.get(current_emotion, (255, 255, 255))
+        landmarks = cached_first_face.landmark
+        face_pts = [10, 234, 152, 454, 1]
+        for pt_idx in face_pts:
+            pt = landmarks[pt_idx]
+            cx, cy = int(pt.x * w), int(pt.y * h)
+            cv2.circle(frame, (cx, cy), 4, color, -1)
+            cv2.circle(frame, (cx, cy), 1, (255, 255, 255), -1)
+
+    # ── SIGN INFERENCE ──
+    sign_data = streamer.update(cached_valid_hands)
+    if sign_data is not None:
+        input_data = np.array([sign_data], dtype=np.float32)
+        prediction = sign_model.predict(input_data, verbose=0)[0]
+        predicted_class = int(np.argmax(prediction))
+        conf = float(prediction[predicted_class] * 100)
+
+        # Track REST vs top-sign confidence for UI
+        rest_confidence = float(prediction[REST_CLASS_ID] * 100) if len(prediction) > REST_CLASS_ID else 0.0
+        top_sign_confidence = conf if predicted_class != REST_CLASS_ID else 0.0
+
+        current_display = label_names[predicted_class]
+        sign_conf = conf
+
+        if conf >= SIGN_CONF_THRESHOLD:
+            vote_buffer.append(predicted_class)
+            if len(vote_buffer) > VOTE_WINDOW: vote_buffer.pop(0)
+            if len(vote_buffer) >= VOTE_WINDOW:
+                counts = Counter(vote_buffer)
+                winner, votes = counts.most_common(1)[0]
+                if votes >= STABLE_VOTE_COUNT:
+                    word = label_names[winner]
+
+                    # 🆕 REST IGNORE LOGIC (matches app)
+                    if winner == REST_CLASS_ID or word == REST_CLASS_NAME:
+                        vote_buffer.clear()
+                        streamer.cooldown_until = time.time() + COOLDOWN_SECONDS
+                        rest_blocked_count += 1
+                        last_commit_info = f"🛑 REST BLOCKED ({rest_blocked_count}x)"
+                        print(f"🛑 REST detected — blocked (total blocked: {rest_blocked_count})")
+                    elif not sentence_words or sentence_words[-1] != word:
+                        sentence_words.append(word)
+                        current_display = word
+                        streamer.cooldown_until = time.time() + COOLDOWN_SECONDS
+                        vote_buffer.clear()
+                        last_commit_info = f"{word} ({conf:.0f}%) [{votes}/{VOTE_WINDOW}]"
+                        print(f"✅ Committed: {word}")
+
+    # ── EMOTION INFERENCE ──
+    emotion_frame_counter += 1
+    if cached_first_face and emotion_frame_counter % EMOTION_EVERY_N_FRAMES == 0:
+        img_in, lm_in = extract_face_emotion(frame, cached_first_face)
+        if img_in is not None:
+            probs = emotion_model.predict([img_in, lm_in], verbose=0)[0]
+            probs = probs * EMOTION_WEIGHTS
+            probs = probs / probs.sum()
+            emotion_probs = probs
+            
+            top_prob = float(probs.max())
+            if top_prob >= EMOTION_CONF_THRESHOLD:
+                pred_idx = int(np.argmax(probs))
+                emotion_conf = top_prob * 100
+                emotion_buffer.append(EMOTION_CLASS_NAMES[pred_idx])
+                current_emotion = Counter(emotion_buffer).most_common(1)[0][0]
+
+    # ── FPS ──
+    fps_frames += 1
+    now = time.time()
+    if now - fps_last_time >= 0.5:
+        fps = fps_frames / (now - fps_last_time)
+        fps_frames = 0
+        fps_last_time = now
+
+    # ============================================
+    # UI OVERLAY
+    # ============================================
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 165), (0, 0, 0), -1)
+    frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+
+    # LEFT SIDE: SIGN
+    status_text = "SIGNING" if streamer.active else "READY"
+    status_color = (0, 255, 0) if streamer.active else (0, 200, 255)
+    if not cached_valid_hands: status_text, status_color = "NO HAND", (0, 0, 255)
+
+    # 🆕 Show REST probability and top-sign probability separately
+    if current_display == REST_CLASS_NAME:
+        display_color = (0, 0, 255)  # Red = REST detected
+    else:
+        display_color = (0, 255, 255)  # Yellow = sign detected
+
+    cv2.putText(frame, f"SIGN: {current_display}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, display_color, 2)
+    cv2.putText(frame, f"Conf: {sign_conf:.1f}%  {status_text}", (15, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+    cv2.putText(frame, f"Buffer: {len(streamer.frames_buffer)}  Votes: {len(vote_buffer)}/{VOTE_WINDOW}", (15, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+    
+    # 🆕 REST indicator bar
+    cv2.putText(frame, f"REST: {rest_confidence:.0f}%", (15, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255) if rest_confidence > 50 else (200, 200, 200), 1)
+    cv2.putText(frame, f"TopSign: {top_sign_confidence:.0f}%", (15, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255) if top_sign_confidence > 50 else (200, 200, 200), 1)
+
+    if last_commit_info:
+        cv2.putText(frame, f"{last_commit_info}", (15, 152), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 100), 1)
+
+    # RIGHT SIDE: EMOTION
+    if current_emotion in EMOTION_CLASS_NAMES:
+        emo_color = EMOTION_COLORS[current_emotion]
+        cv2.putText(frame, f"EMOTION: {current_emotion.upper()}", (w - 180, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, emo_color, 2)
+        cv2.putText(frame, f"Conf: {emotion_conf:.1f}%", (w - 180, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        for i, cname in enumerate(EMOTION_CLASS_NAMES):
+            bar_len = int(emotion_probs[i] * 60)
+            cv2.rectangle(frame, (w - 180, 75 + i*12), (w - 180 + bar_len, 85 + i*12), EMOTION_COLORS[cname], -1)
+            cv2.putText(frame, f"{cname[:3]}: {emotion_probs[i]*100:.0f}%", (w - 110, 85 + i*12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    else:
+        cv2.putText(frame, "EMOTION: WAIT", (w - 180, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 2)
+
+    # FPS TOP CENTER
+    cv2.putText(frame, f"FPS: {fps:.1f}", (w//2 - 30, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+    # SENTENCE BOTTOM
+    if sentence_words:
+        sentence_str = " ".join(sentence_words[-8:])
+        cv2.rectangle(overlay, (0, h - 40), (w, h), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        cv2.putText(frame, f"Sent: {sentence_str}", (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+    cv2.imshow('Signify - v5 (106 classes, REST-aware)', frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'): break
+    if key == ord('c'):
+        sentence_words = []
+        vote_buffer = []
+        current_display = "Cleared"
+        last_commit_info = ""
+        rest_blocked_count = 0
+
+cap.release()
+cv2.destroyAllWindows()
+hands.close()
+face_mesh.close()
+print(f"\n✅ Test complete!")
+print(f"   Total REST blocks: {rest_blocked_count}")
+print(f"   Final sentence: {' '.join(sentence_words)}")
