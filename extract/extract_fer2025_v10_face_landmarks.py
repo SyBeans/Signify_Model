@@ -29,13 +29,13 @@ OUTPUT_PATH  = os.path.expanduser("~/Signify/Signify_Model/landmarks/fer2025_v10
 
 # Same class counts as v9
 IMAGES_PER_CLASS = {
-    "Angry":    8000,
+    "Angry":    15000,
     "Disgust":  8000,
     "Fear":     8000,
-    "Happy":    15000,
-    "Neutral":  15000,
+    "Happy":    40000,
+    "Neutral":  40000,
     "Sad":      8000,
-    "Surprise": 15000,
+    "Surprise": 40000,
 }
 
 TRAIN_RATIO = 0.80
