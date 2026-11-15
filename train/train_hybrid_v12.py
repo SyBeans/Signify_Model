@@ -1,13 +1,13 @@
 """
 train_hybrid_v12.py  —  v12 FAST (v11.8-skeleton + engineered features)
++ AUTO-RESUME support (survives crashes, reboots, power loss)
 
 Changes vs original v12:
   1. 26 engineered features are PRECOMPUTED in NumPy (E_*.npy) → model gets 3rd input
   2. Landmark branch = 5-op normalize → concat with E → 3 residual MLP blocks
   3. Image branch = v11.8 ResNet+SE (fast, proven)
   4. tf.data uses AUTOTUNE everywhere
-Everything else (data, augmentation, optimizer, LR schedule, class weights, TTA)
-is IDENTICAL to v11.8/v12.
+  5. Auto-resume: saves last.keras + training_state.json every epoch
 
 4 classes: Positive, Negative, Surprise, Neutral
 """
@@ -17,6 +17,7 @@ os.environ['OMP_NUM_THREADS']      = '8'
 os.environ['TF_NUM_INTRAOP_THREADS'] = '8'
 os.environ['TF_NUM_INTEROP_THREADS'] = '8'
 
+import json
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
@@ -68,7 +69,7 @@ X_test  = np.load(f"{DATA_PATH}/X_test.npy").astype(np.float32)
 L_test  = np.load(f"{DATA_PATH}/L_test.npy").astype(np.float32)
 y_test_orig = np.load(f"{DATA_PATH}/y_test.npy")
 
-# ── NEW: precomputed engineered features (26) ──
+# ── Precomputed engineered features (26) ──
 E_train = np.load(f"{DATA_PATH}/E_train.npy").astype(np.float32)
 E_val   = np.load(f"{DATA_PATH}/E_val.npy").astype(np.float32)
 E_test  = np.load(f"{DATA_PATH}/E_test.npy").astype(np.float32)
@@ -88,7 +89,7 @@ y_val_cat   = keras.utils.to_categorical(y_val,   NUM_CLASSES).astype(np.float32
 y_test_cat  = keras.utils.to_categorical(y_test,  NUM_CLASSES).astype(np.float32)
 
 # ============================================
-# AUGMENTATION (unchanged — only image + landmarks)
+# AUGMENTATION (only image + landmarks)
 # ============================================
 def augment_pair(image, landmarks_936, label):
     image = tf.image.random_flip_left_right(image)
@@ -215,9 +216,8 @@ model = models.Model(
 model.summary()
 
 # ============================================
-# COMPILE  (identical to v11.8)
+# COMPILE
 # ============================================
-# Class weights from your log — Angry/Sad-heavy Negative
 class_weight_dict = {0: 1.0, 1: 1.05, 2: 1.25, 3: 1.2}
 print(f"\nClass weights: {class_weight_dict}")
 
@@ -237,9 +237,45 @@ model.compile(
 )
 
 # ============================================
-# CALLBACKS
+# CALLBACKS + RESUME STATE
 # ============================================
-ckpt_path = f"{MODELS_PATH}/emotion_hybrid_v12_fast_best.keras"
+ckpt_path  = f"{MODELS_PATH}/emotion_hybrid_v12_fast_best.keras"
+last_ckpt  = f"{MODELS_PATH}/emotion_hybrid_v12_fast_last.keras"
+STATE_FILE = f"{MODELS_PATH}/training_state.json"
+
+# --- Resume detection ---
+start_epoch = 0
+resume_from_last = False
+if os.path.exists(STATE_FILE) and os.path.exists(last_ckpt):
+    try:
+        with open(STATE_FILE) as f:
+            _state = json.load(f)
+        start_epoch = int(_state.get("last_epoch", -1)) + 1
+        resume_from_last = True
+        print(f"🔄 RESUMING from epoch {start_epoch} "
+              f"(best val_acc so far: {_state.get('best_val_acc', 0):.4f})")
+    except Exception as e:
+        print(f"⚠️  Could not read resume state ({e}) — starting fresh")
+
+class StateTracker(keras.callbacks.Callback):
+    def __init__(self, path, starting_best=0.0):
+        super().__init__()
+        self.path = path
+        self.best = starting_best
+    def on_epoch_end(self, epoch, logs=None):
+        va = float(logs.get("val_accuracy", 0))
+        if va > self.best:
+            self.best = va
+        with open(self.path, "w") as f:
+            json.dump({"last_epoch": int(epoch), "best_val_acc": self.best}, f)
+
+_initial_best = 0.0
+if resume_from_last:
+    try:
+        with open(STATE_FILE) as f:
+            _initial_best = float(json.load(f).get("best_val_acc", 0.0))
+    except Exception:
+        pass
 
 callbacks_list = [
     callbacks.LearningRateScheduler(lr_schedule, verbose=1),
@@ -250,6 +286,13 @@ callbacks_list = [
         mode='max',
         verbose=1,
     ),
+    # Save EVERY epoch (for resume). Not best-only.
+    callbacks.ModelCheckpoint(
+        last_ckpt,
+        save_best_only=False,
+        verbose=0,
+    ),
+    StateTracker(STATE_FILE, starting_best=_initial_best),
     callbacks.EarlyStopping(
         monitor='val_accuracy',
         patience=20,
@@ -267,18 +310,34 @@ callbacks_list = [
 ]
 
 # ============================================
-# TRAIN
+# TRAIN  (auto-resume if last.keras exists)
 # ============================================
 print("\n" + "=" * 60); print(f"🚀 TRAINING v12 FAST (seed={SEED})"); print("=" * 60)
 
-history = model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=EPOCHS,
-    class_weight=class_weight_dict,
-    callbacks=callbacks_list,
-    verbose=1,
-)
+if resume_from_last and start_epoch < EPOCHS:
+    print(f"🔁 Loading weights from {last_ckpt}")
+    model = keras.models.load_model(last_ckpt)
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCHS,
+        initial_epoch=start_epoch,
+        class_weight=class_weight_dict,
+        callbacks=callbacks_list,
+        verbose=1,
+    )
+else:
+    if resume_from_last:
+        print(f"ℹ️  training_state.json says epoch {start_epoch} ≥ EPOCHS={EPOCHS} — "
+              f"starting fresh")
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCHS,
+        class_weight=class_weight_dict,
+        callbacks=callbacks_list,
+        verbose=1,
+    )
 
 # ============================================
 # TTA EVALUATION on TEST
@@ -287,12 +346,11 @@ print("\n" + "=" * 60); print("🧪 TTA EVALUATION (test set)"); print("=" * 60)
 
 def predict_tta(X, L, E, batch=256):
     preds = model.predict([X, L, E], batch_size=batch, verbose=0)
-    # hflip on image, landmarks mirrored
     Xf = X[:, :, ::-1, :]
     Lf = L.reshape(-1, NUM_LANDMARKS, 2).copy()
     Lf[:, :, 0] = 1.0 - Lf[:, :, 0]
     Lf = Lf.reshape(-1, RAW_LANDMARK_DIM)
-    Ef = E   # note: engineered features were NOT flipped — TTA on E is approximate
+    Ef = E   # TTA on E is approximate — matches v11.8 behavior
     preds = (preds + model.predict([Xf, Lf, Ef], batch_size=batch, verbose=0)) / 2.0
     return preds
 
@@ -321,9 +379,9 @@ plt.close()
 final_path = f"{MODELS_PATH}/emotion_hybrid_v12_fast.keras"
 model.save(final_path)
 print(f"\n✅ Saved best:  {ckpt_path}")
+print(f"✅ Saved last:  {last_ckpt}")
 print(f"✅ Saved final: {final_path}")
 
-# Per-class accuracy print
 print("\nPer-class accuracy:")
 for c, name in enumerate(CLASS_NAMES):
     mask = (y_test == c)
