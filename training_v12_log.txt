@@ -1,0 +1,29 @@
+nohup: ignoring input
+2026-11-15 17:16:42.554752: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:479] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2026-11-15 17:16:42.864966: E external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:10575] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+2026-11-15 17:16:42.866494: E external/local_xla/xla/stream_executor/cuda/cuda_blas.cc:1442] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+============================================================
+📥 LOADING hybrid v12 (seed=42)
+============================================================
+Train: X=(64000, 48, 48, 1), L=(64000, 936), y=(64000,)
+Val:   X=(8000, 48, 48, 1), L=(8000, 936), y=(8000,)
+Test:  X=(8000, 48, 48, 1), L=(8000, 936), y=(8000,)
+
+7-class (raw):   [ 6400  1600  1600 16000 16000  6400 16000]
+4-class (train): [16000 16000 16000 16000]
+
+============================================================
+🏗️  BUILDING HYBRID v12
+============================================================
+Traceback (most recent call last):
+  File "/home/syy/Signify/Signify_Model/train/train_hybrid_v12.py", line 343, in <module>
+    model = models.Model(inputs=[img_input, lm_input], outputs=outputs,
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/syy/Signify/Signify_Model/venv_train/lib/python3.12/site-packages/keras/src/models/functional.py", line 136, in __init__
+    Function.__init__(self, inputs, outputs, name=name)
+  File "/home/syy/Signify/Signify_Model/venv_train/lib/python3.12/site-packages/keras/src/ops/function.py", line 78, in __init__
+    (nodes, nodes_by_depth, operations, operations_by_depth) = map_graph(
+                                                               ^^^^^^^^^^
+  File "/home/syy/Signify/Signify_Model/venv_train/lib/python3.12/site-packages/keras/src/ops/function.py", line 384, in map_graph
+    raise ValueError(
+ValueError: The name "lmpick_159" is used 2 times in the model. All operation names should be unique.

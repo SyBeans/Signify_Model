@@ -42,7 +42,7 @@ IMG_SIZE    = 48
 NUM_LANDMARKS = 468
 RAW_LANDMARK_DIM = NUM_LANDMARKS * 2  # 936
 ENGINEERED_DIM = 26
-USE_ENGINEERED = True  # ← Set False if TFLite export fails on Lambda ops
+USE_ENGINEERED = True
 
 BATCH_SIZE  = 256
 EPOCHS      = 100
@@ -51,7 +51,7 @@ SEED        = 42
 
 CLASS_NAMES = ["Positive", "Negative", "Surprise", "Neutral"]
 NUM_CLASSES = 4
-GROUP_MAP = np.array([1, 1, 1, 0, 3, 1, 2], dtype=np.int32)  # 7-class → 4-class
+GROUP_MAP = np.array([1, 1, 1, 0, 3, 1, 2], dtype=np.int32)
 
 os.makedirs(MODELS_PATH, exist_ok=True)
 np.random.seed(SEED); tf.random.set_seed(SEED); random.seed(SEED)
@@ -88,7 +88,7 @@ y_val_cat   = keras.utils.to_categorical(y_val,   NUM_CLASSES).astype(np.float32
 y_test_cat  = keras.utils.to_categorical(y_test,  NUM_CLASSES).astype(np.float32)
 
 # ============================================
-# PREPROCESSING LAYERS (baked inside model for TFLite)
+# PREPROCESSING LAYERS (FIXED: no duplicate names)
 # ============================================
 def build_preprocessing_layers():
     def normalize(lm_936):
@@ -110,93 +110,169 @@ def build_preprocessing_layers():
         return normalized, flat
 
     def engineered(normalized_468x2):
+        # ────────────────────────────────────────────────
+        # FIX: Pre-extract all unique landmarks ONCE, cache
+        # distance computations. Prevents duplicate layer
+        # names like "lmpick_159" appearing twice.
+        # ────────────────────────────────────────────────
+        unique_indices = [
+            159, 145, 33, 133, 386, 374, 362, 263,   # eyes
+            13, 14, 61, 291, 105, 334, 107, 336,     # mouth + brows
+            10, 152, 234, 454, 1, 172, 397, 93, 323  # face + jaw
+        ]
+
+        lm_xy = {}
+        lm_y = {}
+        for idx in unique_indices:
+            lm_xy[idx] = layers.Lambda(
+                lambda x, i=idx: x[:, i, :],
+                name=f'lmxy_{idx}'
+            )(normalized_468x2)
+            lm_y[idx] = layers.Lambda(
+                lambda x: x[:, 1:2],
+                name=f'lmy_{idx}'
+            )(lm_xy[idx])
+
+        dist_cache = {}
+
         def dist(a_idx, b_idx):
-            a = layers.Lambda(lambda x: x[:, a_idx, :], name=f'lmpick_{a_idx}')(normalized_468x2)
-            b = layers.Lambda(lambda x: x[:, b_idx, :], name=f'lmpick_{b_idx}')(normalized_468x2)
-            diff = layers.Subtract()([a, b])
-            return layers.Lambda(
+            key = (a_idx, b_idx)
+            if key in dist_cache:
+                return dist_cache[key]
+            diff = layers.Subtract(name=f'lmsub_{a_idx}_{b_idx}')(
+                [lm_xy[a_idx], lm_xy[b_idx]]
+            )
+            result = layers.Lambda(
                 lambda x: tf.norm(x, axis=-1, keepdims=True) + 1e-6,
                 name=f'lmdist_{a_idx}_{b_idx}'
             )(diff)
+            dist_cache[key] = result
+            return result
 
         def y_coord(idx):
-            return layers.Lambda(lambda x: x[:, idx, 1:2], name=f'lmy_{idx}')(normalized_468x2)
+            return lm_y[idx]
 
         features = []
 
-        # Eye Aspect Ratios
-        left_ear_num = dist(159, 145); left_ear_den = dist(33, 133)
-        left_ear = layers.Lambda(lambda x: x[0] / (x[1] + 1e-6), name='left_ear')([left_ear_num, left_ear_den])
+        # 1-2. Eye Aspect Ratios
+        left_ear_num = dist(159, 145)
+        left_ear_den = dist(33, 133)
+        left_ear = layers.Lambda(
+            lambda x: x[0] / (x[1] + 1e-6), name='left_ear'
+        )([left_ear_num, left_ear_den])
         features.append(left_ear)
 
-        right_ear_num = dist(386, 374); right_ear_den = dist(362, 263)
-        right_ear = layers.Lambda(lambda x: x[0] / (x[1] + 1e-6), name='right_ear')([right_ear_num, right_ear_den])
+        right_ear_num = dist(386, 374)
+        right_ear_den = dist(362, 263)
+        right_ear = layers.Lambda(
+            lambda x: x[0] / (x[1] + 1e-6), name='right_ear'
+        )([right_ear_num, right_ear_den])
         features.append(right_ear)
 
-        # Mouth Aspect Ratio
-        mouth_h = dist(13, 14); mouth_w = dist(61, 291)
-        mar = layers.Lambda(lambda x: x[0] / (x[1] + 1e-6), name='mar')([mouth_h, mouth_w])
+        # 3. Mouth Aspect Ratio
+        mouth_h = dist(13, 14)
+        mouth_w = dist(61, 291)
+        mar = layers.Lambda(
+            lambda x: x[0] / (x[1] + 1e-6), name='mar'
+        )([mouth_h, mouth_w])
         features.append(mar)
 
-        # Mouth curve
-        l_cy = y_coord(61); r_cy = y_coord(291)
-        c_up = y_coord(13); c_lo = y_coord(14)
-        mouth_center_y = layers.Lambda(lambda x: (x[0] + x[1]) / 2.0)([c_up, c_lo])
-        corners_avg = layers.Lambda(lambda x: (x[0] + x[1]) / 2.0)([l_cy, r_cy])
-        mouth_curve = layers.Subtract(name='mouth_curve')([mouth_center_y, corners_avg])
+        # 4. Mouth curve
+        l_cy = y_coord(61)
+        r_cy = y_coord(291)
+        c_up = y_coord(13)
+        c_lo = y_coord(14)
+        mouth_center_y = layers.Lambda(
+            lambda x: (x[0] + x[1]) / 2.0, name='mouth_center_y'
+        )([c_up, c_lo])
+        corners_avg = layers.Lambda(
+            lambda x: (x[0] + x[1]) / 2.0, name='corners_avg'
+        )([l_cy, r_cy])
+        mouth_curve = layers.Subtract(name='mouth_curve')(
+            [mouth_center_y, corners_avg]
+        )
         features.append(mouth_curve)
 
-        # Distances
-        features.append(dist(61, 133))       # left corner to eye
-        features.append(dist(291, 362))      # right corner to eye
-        features.append(dist(105, 159))      # left brow to eye
-        features.append(dist(334, 386))      # right brow to eye
-        features.append(dist(107, 336))      # inner brow distance
+        # 5-9. Distances
+        features.append(dist(61, 133))
+        features.append(dist(291, 362))
+        features.append(dist(105, 159))
+        features.append(dist(334, 386))
+        features.append(dist(107, 336))
 
-        # Brow heights
-        lb_above = layers.Subtract(name='lb_above')([y_coord(159), y_coord(105)])
+        # 10-11. Brow heights
+        lb_above = layers.Subtract(name='lb_above')(
+            [y_coord(159), y_coord(105)]
+        )
         features.append(lb_above)
-        rb_above = layers.Subtract(name='rb_above')([y_coord(386), y_coord(334)])
+        rb_above = layers.Subtract(name='rb_above')(
+            [y_coord(386), y_coord(334)]
+        )
         features.append(rb_above)
 
-        # Face aspect
-        face_h = dist(10, 152); face_w = dist(234, 454)
-        face_aspect = layers.Lambda(lambda x: x[0] / (x[1] + 1e-6), name='face_aspect')([face_h, face_w])
+        # 12. Face aspect
+        face_h = dist(10, 152)
+        face_w = dist(234, 454)
+        face_aspect = layers.Lambda(
+            lambda x: x[0] / (x[1] + 1e-6), name='face_aspect'
+        )([face_h, face_w])
         features.append(face_aspect)
 
-        # More geometry
-        features.append(dist(1, 13))         # nose to mouth
-        features.append(dist(152, 14))       # chin to lower lip
-        features.append(dist(172, 397))      # jaw low width
-        features.append(dist(93, 323))       # jaw mid width
+        # 13-16. More geometry
+        features.append(dist(1, 13))
+        features.append(dist(152, 14))
+        features.append(dist(172, 397))
+        features.append(dist(93, 323))
 
-        # Nose vs eyes
-        leye_y = y_coord(159); reye_y = y_coord(386); nose_y = y_coord(1)
-        eye_avg_y = layers.Lambda(lambda x: (x[0] + x[1]) / 2.0)([leye_y, reye_y])
-        nose_vs_eyes = layers.Subtract(name='nose_vs_eyes')([nose_y, eye_avg_y])
+        # 17. Nose vs eyes
+        leye_y = y_coord(159)
+        reye_y = y_coord(386)
+        nose_y = y_coord(1)
+        eye_avg_y = layers.Lambda(
+            lambda x: (x[0] + x[1]) / 2.0, name='eye_avg_y'
+        )([leye_y, reye_y])
+        nose_vs_eyes = layers.Subtract(name='nose_vs_eyes')(
+            [nose_y, eye_avg_y]
+        )
         features.append(nose_vs_eyes)
 
-        # Asymmetries
-        features.append(layers.Lambda(lambda x: tf.abs(x[0] - x[1]), name='ear_diff')([left_ear, right_ear]))
-        features.append(layers.Lambda(lambda x: tf.abs(x[0] - x[1]), name='corner_diff')([l_cy, r_cy]))
-        features.append(layers.Lambda(lambda x: tf.abs(x[0] - x[1]), name='brow_asym')([lb_above, rb_above]))
+        # 18-20. Asymmetries
+        features.append(layers.Lambda(
+            lambda x: tf.abs(x[0] - x[1]), name='ear_diff'
+        )([left_ear, right_ear]))
+        features.append(layers.Lambda(
+            lambda x: tf.abs(x[0] - x[1]), name='corner_diff'
+        )([l_cy, r_cy]))
+        features.append(layers.Lambda(
+            lambda x: tf.abs(x[0] - x[1]), name='brow_asym'
+        )([lb_above, rb_above]))
 
-        # Eye width ratio
-        left_eye_w = dist(33, 133); right_eye_w = dist(362, 263)
-        eye_w_ratio = layers.Lambda(lambda x: x[0] / (x[1] + 1e-6), name='eye_w_ratio')([left_eye_w, right_eye_w])
+        # 21. Eye width ratio (uses cached dist results)
+        left_eye_w = dist(33, 133)      # cached
+        right_eye_w = dist(362, 263)    # cached
+        eye_w_ratio = layers.Lambda(
+            lambda x: x[0] / (x[1] + 1e-6), name='eye_w_ratio'
+        )([left_eye_w, right_eye_w])
         features.append(eye_w_ratio)
 
-        # Mouth below nose
-        corners_avg2 = layers.Lambda(lambda x: (x[0] + x[1]) / 2.0)([l_cy, r_cy])
-        mouth_below_nose = layers.Subtract(name='mouth_below_nose')([corners_avg2, nose_y])
+        # 22. Mouth below nose
+        corners_avg2 = layers.Lambda(
+            lambda x: (x[0] + x[1]) / 2.0, name='corners_avg2'
+        )([l_cy, r_cy])
+        mouth_below_nose = layers.Subtract(name='mouth_below_nose')(
+            [corners_avg2, nose_y]
+        )
         features.append(mouth_below_nose)
 
-        # Brow to nose
-        bn_l = dist(107, 1); bn_r = dist(336, 1)
-        brow_nose_avg = layers.Lambda(lambda x: (x[0] + x[1]) / 2.0, name='brow_nose_avg')([bn_l, bn_r])
+        # 23. Brow to nose
+        bn_l = dist(107, 1)
+        bn_r = dist(336, 1)
+        brow_nose_avg = layers.Lambda(
+            lambda x: (x[0] + x[1]) / 2.0, name='brow_nose_avg'
+        )([bn_l, bn_r])
         features.append(brow_nose_avg)
 
-        # Raw dims
+        # 24-26. Raw dims (reuse cached distances)
         features.append(mouth_w)
         features.append(mouth_h)
         features.append(left_eye_w)
@@ -304,7 +380,7 @@ def residual_mlp_block(x, units, drop=0.3):
 
 print("\n" + "=" * 60); print("🏗️  BUILDING HYBRID v12"); print("=" * 60)
 
-# --- IMAGE BRANCH (ResNet+SE, unchanged from v11.8) ---
+# --- IMAGE BRANCH ---
 img_input = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 1), name="image")
 xi = layers.Conv2D(32, 3, padding='same', use_bias=False)(img_input)
 xi = layers.BatchNormalization()(xi); xi = layers.Activation('relu')(xi)
@@ -317,7 +393,7 @@ xi = layers.Dense(128, use_bias=False)(xi)
 xi = layers.BatchNormalization()(xi); xi = layers.Activation('relu')(xi)
 xi = layers.Dropout(0.4)(xi)
 
-# --- LANDMARK BRANCH (normalized + engineered + residual MLP) ---
+# --- LANDMARK BRANCH ---
 lm_input = layers.Input(shape=(RAW_LANDMARK_DIM,), name="landmarks")
 lm_preprocessed = build_preprocessing_layers()(lm_input)
 
@@ -376,7 +452,6 @@ model.compile(
     loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
     metrics=['accuracy'])
 
-# Class weights — v11.8 values that worked well
 class_weight_dict = {0: 1.0, 1: 1.05, 2: 1.25, 3: 1.20}
 print(f"\nClass weights: {class_weight_dict}")
 
@@ -434,7 +509,6 @@ plt.title(f'Hybrid v12 Balanced (TTA acc={acc*100:.2f}%)')
 plt.tight_layout()
 plt.savefig(os.path.join(MODELS_PATH, f'cm_v12_seed{SEED}.png'), dpi=150)
 
-# Compare to v11.8
 print(f"\n{'='*60}")
 print(f"COMPARISON vs v11.8")
 print(f"{'='*60}")
@@ -444,4 +518,4 @@ print(f"  Δ:                   {acc*100 - 80.12:+.2f}%")
 
 model.save(os.path.join(MODELS_PATH, f'emotion_hybrid_v12_seed{SEED}.h5'))
 print(f"\n✅ Saved: {MODELS_PATH}/emotion_hybrid_v12_seed{SEED}.h5")
-print(f"\n⚠️  NEXT: Convert to TFLite with reexport_emotion.py")
+print(f"\n⚠️  NEXT: Test TFLite export")
