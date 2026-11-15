@@ -88,7 +88,7 @@ y_val_cat   = keras.utils.to_categorical(y_val,   NUM_CLASSES).astype(np.float32
 y_test_cat  = keras.utils.to_categorical(y_test,  NUM_CLASSES).astype(np.float32)
 
 # ============================================
-# PREPROCESSING LAYERS (FIXED: no duplicate names)
+# PREPROCESSING LAYERS (FIXED: shapes + no duplicate names)
 # ============================================
 def build_preprocessing_layers():
     def normalize(lm_936):
@@ -98,8 +98,9 @@ def build_preprocessing_layers():
             name='lm_center'
         )(lm)
         centered = layers.Subtract(name='lm_subtract')([lm, center])
+        # ✅ FIX: [..., None] → shape (batch, 1, 1) for proper broadcasting
         max_dist = layers.Lambda(
-            lambda x: tf.reduce_max(tf.norm(x, axis=-1), axis=1, keepdims=True) + 1e-6,
+            lambda x: tf.reduce_max(tf.norm(x, axis=-1), axis=1, keepdims=True)[..., None] + 1e-6,
             name='lm_max_dist'
         )(centered)
         normalized = layers.Lambda(
@@ -110,11 +111,7 @@ def build_preprocessing_layers():
         return normalized, flat
 
     def engineered(normalized_468x2):
-        # ────────────────────────────────────────────────
-        # FIX: Pre-extract all unique landmarks ONCE, cache
-        # distance computations. Prevents duplicate layer
-        # names like "lmpick_159" appearing twice.
-        # ────────────────────────────────────────────────
+        # Pre-extract unique landmarks ONCE to prevent duplicate layer names
         unique_indices = [
             159, 145, 33, 133, 386, 374, 362, 263,   # eyes
             13, 14, 61, 291, 105, 334, 107, 336,     # mouth + brows
@@ -248,8 +245,8 @@ def build_preprocessing_layers():
         )([lb_above, rb_above]))
 
         # 21. Eye width ratio (uses cached dist results)
-        left_eye_w = dist(33, 133)      # cached
-        right_eye_w = dist(362, 263)    # cached
+        left_eye_w = dist(33, 133)
+        right_eye_w = dist(362, 263)
         eye_w_ratio = layers.Lambda(
             lambda x: x[0] / (x[1] + 1e-6), name='eye_w_ratio'
         )([left_eye_w, right_eye_w])
