@@ -5,13 +5,20 @@ v12.1 = v11.8 EXACT (image, TTA, LR, aug, fusion)
       + balanced dataset (fer2025_v12_balanced)
       + tuned class weights for balanced data
 
-Class weights: {0: 1.0, 1: 1.20, 2: 1.05, 3: 1.15}
+Class weights: {0: 1.0, 1: 1.05, 2: 1.05, 3: 1.25}
   - Positive 1.0  (easy, no boost)
-  - Negative 1.20 (hardest class — 4 emotions merged, needs lift)
-  - Surprise 1.05 (reduced — balanced data + 3-input already gives 85%)
-  - Neutral  1.15 (boosted to match v11.10's winning pattern)
+  - Negative 1.05 (mild — balanced data prevents it stealing Neutral)
+  - Surprise 1.05 (mild — 3-input features help)
+  - Neutral  1.25 (THE fix — was being misclassified as Negative)
 
-Expected: ~81.5-82.5% overall (Negative ~78-80%, Surprise ~83-85%, Neutral ~79-81%)
+Root cause insight (from continue.txt):
+  v11.x imbalanced data (32k Negative vs 15k Neutral) trained the model to
+  default to "Negative" on ambiguous faces → Neutral was being STOLEN by Negative.
+  Fix: balance data + boost Neutral weight (1.25) + leave Negative mild (1.05).
+  The 26 engineered features (mar, mouth_curve, brow_asym) directly help
+  distinguish Neutral from Negative.
+
+Expected: ~81.5-82.5% overall (Negative ~80%, Neutral ~80-82%, Surprise ~82-84%)
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -91,14 +98,18 @@ y_val_cat   = keras.utils.to_categorical(y_val,   NUM_CLASSES).astype(np.float32
 y_test_cat  = keras.utils.to_categorical(y_test,  NUM_CLASSES).astype(np.float32)
 
 # ============================================
-# CLASS WEIGHTS — tuned for balanced data (informed by v11.10's win)
+# CLASS WEIGHTS — Neutral is the fix, Negative is fine
 # ============================================
-class_weight_dict = {0: 1.0, 1: 1.20, 2: 1.05, 3: 1.15}
+class_weight_dict = {0: 1.0, 1: 1.05, 2: 1.05, 3: 1.25}
 print(f"\nClass weights: {class_weight_dict}")
 print(f"  Positive 1.0  (easy, no boost)")
-print(f"  Negative 1.20 (hardest — 4 emotions merged, needs lift)")
-print(f"  Surprise 1.05 (reduced — balanced data + 3-input handles it)")
-print(f"  Neutral  1.15 (boosted — matches v11.10's winning pattern)")
+print(f"  Negative 1.05 (mild — balanced data prevents it stealing Neutral)")
+print(f"  Surprise 1.05 (mild — 3-input features help)")
+print(f"  Neutral  1.25 (THE fix — was being stolen by Negative)")
+print(f"\n  Rationale: v11.x imbalanced data (32k Neg vs 15k Neutral) →")
+print(f"             model defaulted to Negative on ambiguous faces →")
+print(f"             Neutral was the victim (76.73% in v11.8).")
+print(f"             Fix = boost Neutral weight, leave Negative alone.")
 
 # ============================================
 # AUGMENTATION (v11.8 exact — flip + rot + noise)
