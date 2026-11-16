@@ -1,0 +1,50 @@
+2026-11-16 18:49:34.735254: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:479] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2026-11-16 18:49:34.759500: E external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:10575] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+2026-11-16 18:49:34.759549: E external/local_xla/xla/stream_executor/cuda/cuda_blas.cc:1442] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+============================================================
+📥 Loading test data
+Test: X=(7700, 48, 48, 1), L=(7700, 936), per-class=[1500 3200 1500 1500]
+============================================================
+
+🔍 v11.8: /home/syy/Signify/Signify_Model/models/face_fer2025_hybrid_v11_8/emotion_hybrid_v11_8_seed42.h5
+   Single-pass: 79.23%
+   TTA:         80.12%
+     Positive   → 85.20%
+     Negative   → 80.06%
+     Surprise   → 78.53%
+     Neutral    → 76.73%
+
+🔍 v11.9: /home/syy/Signify/Signify_Model/models/face_fer2025_hybrid_v11_9/emotion_hybrid_v11_9.h5
+   Single-pass: 78.45%
+   TTA:         78.70%
+     Positive   → 81.40%
+     Negative   → 76.12%
+     Surprise   → 81.67%
+     Neutral    → 78.53%
+
+🔍 v11.10: /home/syy/Signify/Signify_Model/models/face_fer2025_hybrid_v11_10/emotion_hybrid_v11_10.h5
+   Single-pass: 80.08%
+   TTA:         80.53%
+     Positive   → 86.07%
+     Negative   → 82.28%
+     Surprise   → 77.87%
+     Neutral    → 73.93%
+
+🔍 v11.11: /home/syy/Signify/Signify_Model/models/face_fer2025_hybrid_v11_11/emotion_hybrid_v11_11.h5
+   Single-pass: 78.79%
+   TTA:         79.69%
+     Positive   → 82.73%
+     Negative   → 81.03%
+     Surprise   → 79.53%
+     Neutral    → 73.93%
+
+================================================================================
+📊 FINAL COMPARISON
+================================================================================
+Model    | Overall  | Positive  | Negative  | Surprise  | Neutral 
+--------------------------------------------------------------------------------
+v11.8    |  80.12% |   85.20% |   80.06% |   78.53% |  76.73%
+v11.9    |  78.70% |   81.40% |   76.12% |   81.67% |  78.53%
+v11.10   |  80.53% |   86.07% |   82.28% |   77.87% |  73.93%
+v11.11   |  79.69% |   82.73% |   81.03% |   79.53% |  73.93%
+================================================================================

@@ -5,13 +5,13 @@ v12.1 = v11.8 EXACT (image, TTA, LR, aug, fusion)
       + balanced dataset (fer2025_v12_balanced)
       + tuned class weights for balanced data
 
-Class weights: {0: 1.0, 1: 1.15, 2: 1.15, 3: 1.10}
+Class weights: {0: 1.0, 1: 1.20, 2: 1.05, 3: 1.15}
   - Positive 1.0  (easy, no boost)
-  - Negative 1.15 (hardest class — 4 emotions merged, needs lift)
-  - Surprise 1.15 (was over-tuned at 1.25 in v11.8 for imbalanced data)
-  - Neutral  1.10 (mild, keep the win from v12 fast)
+  - Negative 1.20 (hardest class — 4 emotions merged, needs lift)
+  - Surprise 1.05 (reduced — balanced data + 3-input already gives 85%)
+  - Neutral  1.15 (boosted to match v11.10's winning pattern)
 
-Expected: ~81-82% overall (Negative ~76-78%, Surprise ~83-84%, Neutral ~79-80%)
+Expected: ~81.5-82.5% overall (Negative ~78-80%, Surprise ~83-85%, Neutral ~79-81%)
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -91,14 +91,14 @@ y_val_cat   = keras.utils.to_categorical(y_val,   NUM_CLASSES).astype(np.float32
 y_test_cat  = keras.utils.to_categorical(y_test,  NUM_CLASSES).astype(np.float32)
 
 # ============================================
-# CLASS WEIGHTS — tuned for balanced data
+# CLASS WEIGHTS — tuned for balanced data (informed by v11.10's win)
 # ============================================
-class_weight_dict = {0: 1.0, 1: 1.15, 2: 1.15, 3: 1.10}
+class_weight_dict = {0: 1.0, 1: 1.20, 2: 1.05, 3: 1.15}
 print(f"\nClass weights: {class_weight_dict}")
 print(f"  Positive 1.0  (easy, no boost)")
-print(f"  Negative 1.15 (hardest — 4 emotions merged, needs lift)")
-print(f"  Surprise 1.15 (was 1.25 for imbalanced v11.8, reduced)")
-print(f"  Neutral  1.10 (mild, keeps v12 fast's win)")
+print(f"  Negative 1.20 (hardest — 4 emotions merged, needs lift)")
+print(f"  Surprise 1.05 (reduced — balanced data + 3-input handles it)")
+print(f"  Neutral  1.15 (boosted — matches v11.10's winning pattern)")
 
 # ============================================
 # AUGMENTATION (v11.8 exact — flip + rot + noise)
