@@ -1,0 +1,34 @@
+nohup: ignoring input
+2026-11-20 13:45:29.855304: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:479] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2026-11-20 13:45:29.883002: E external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:10575] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+2026-11-20 13:45:29.883107: E external/local_xla/xla/stream_executor/cuda/cuda_blas.cc:1442] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+/home/syy/Signify/Signify_Model/venv_train/lib/python3.12/site-packages/keras/src/trainers/epoch_iterator.py:74: UserWarning: `shuffle=True` was passed, but will be ignored since the data `x` was provided as a tf.data.Dataset. The Dataset is expected to already be shuffled (via `.shuffle(buffer_size)`).
+  self.data_adapter = data_adapters.get_data_adapter(
+============================================================
+🛡️  SAFETY CHECK
+============================================================
+  Source (read-only):  models/face_fer2025_hybrid_v12_2/emotion_v12_2_best.keras
+  Target (new folder): models/face_fer2025_hybrid_v12_3/
+  ✅ v12.2 will NOT be modified (different folder)
+============================================================
+
+📥 LOADING v13 data
+  Train: (128000, 48, 48, 1) | Val: (16000, 48, 48, 1) | Test: (16000, 48, 48, 1)
+  Train 7-class: [ 8000  8000  8000 32000 32000  8000 32000]
+
+📊 Class weights: {0: 1.0, 1: 1.45, 2: 1.05, 3: 1.0}
+   Positive 1.0  (unchanged)
+   Negative 1.45 (+0.40 — main boost, was 1.05)
+   Surprise 1.05 (unchanged — preserve 88.85%)
+   Neutral  1.0  (−0.10 — undo over-weight, was 1.10)
+
+============================================================
+🔨 Building v12.2 architecture + loading v12.2 weights
+============================================================
+📥 Loading weights from: models/face_fer2025_hybrid_v12_2/emotion_v12_2_best.keras
+✅ Weights loaded — starting point is v12.2 (85.34% TTA)
+
+============================================================
+🚀 TRAINING v12.3 (LR=5e-05, 12 epochs)
+============================================================
+Epoch 1/12
