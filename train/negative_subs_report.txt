@@ -1,0 +1,40 @@
+2026-11-20 13:24:49.258386: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:479] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+2026-11-20 13:24:49.290498: E external/local_xla/xla/stream_executor/cuda/cuda_dnn.cc:10575] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+2026-11-20 13:24:49.290581: E external/local_xla/xla/stream_executor/cuda/cuda_blas.cc:1442] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+============================================================
+🔨 Building v12.2 architecture...
+📥 Loading weights from: models/face_fer2025_hybrid_v12_2/emotion_v12_2.keras
+✅ Weights loaded
+============================================================
+Test: X=(16000, 48, 48, 1), L=(16000, 936), E=(16000, 26)
+Test 7-class: [1000 1000 1000 4000 4000 1000 4000]
+
+📊 Predicting...
+
+============================================================
+NEGATIVE sub-emotion recall (from 4-class model)
+============================================================
+  Sub-emotion  | Test n | Pred Neg |  Recall
+------------------------------------------------------------
+  Angry        |   1000 |      788 |  78.80%  ███████████████
+  Disgust      |   1000 |      843 |  84.30%  ████████████████
+  Fear         |   1000 |      747 |  74.70%  ██████████████
+  Sad          |   1000 |      695 |  69.50%  █████████████
+------------------------------------------------------------
+  OVERALL NEG  |   4000 |     3073 |  76.83%
+
+============================================================
+Where do MISSED Negative samples go?
+============================================================
+  → Positive  :   125 ( 3.12%)  █
+  → Negative  :  3073 (76.83%)  ██████████████████████████████████████ ✅ (correct)
+  → Surprise  :   359 ( 8.97%)  ████
+  → Neutral   :   443 (11.07%)  █████
+
+============================================================
+INTERPRETATION
+============================================================
+  ⚠️  Angry 78.8% + Sad 69.5% — one is 75-80%
+     → Still functional for emergencies
+     → Deploy, document the weak one
+============================================================
